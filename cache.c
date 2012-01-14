@@ -42,7 +42,7 @@ static FILE *cache_open(char const *mode)
     FILE * fp;
 
     /* Get the prefix */
-    prefix = get_cvsrc_dir();
+    prefix = get_cvsps_dir();
     if (!prefix)
 	return NULL;
     
@@ -214,7 +214,8 @@ time_t read_cache()
 		    rev = cvs_file_add_revision(f, buff);
 		    if (strcmp(rev->branch, p) != 0)
 		    {
-			debug(DEBUG_APPERROR, "branch mismatch %s != %s", rev->branch, p);
+			debug(DEBUG_APPERROR, "branch mismatch for %s:%s %s != %s", 
+			      rev->file->filename, rev->rev, rev->branch, p);
 		    }
 		}
 	    }
@@ -460,7 +461,9 @@ void write_cache(time_t cache_date, void * ps_tree_bytime)
 	{
 	    char * tag = (char *)rev_iter->he_key;
 	    CvsFileRevision * rev = (CvsFileRevision*)rev_iter->he_obj;
-	    fprintf(cache_fp, "%s: %s\n", tag, rev->rev);
+	    
+	    if (rev->present)
+		fprintf(cache_fp, "%s: %s\n", tag, rev->rev);
 	}
 
 	fprintf(cache_fp, "\n");
@@ -469,7 +472,8 @@ void write_cache(time_t cache_date, void * ps_tree_bytime)
 	while ((rev_iter = next_hash_entry(file->revisions)))
 	{
 	    CvsFileRevision * rev = (CvsFileRevision*)rev_iter->he_obj;
-	    fprintf(cache_fp, "%s %s\n", rev->rev, rev->branch);
+	    if (rev->present)
+		fprintf(cache_fp, "%s %s\n", rev->rev, rev->branch);
 	}
 
 	fprintf(cache_fp, "\n");

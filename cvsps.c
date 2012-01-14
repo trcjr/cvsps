@@ -27,8 +27,9 @@
 #include "cvsps.h"
 #include "util.h"
 #include "stats.h"
+#include "cap.h"
 
-RCSID("$Id: cvsps.c,v 4.66 2003/03/18 15:16:25 david Exp $");
+RCSID("$Id: cvsps.c,v 4.70 2003/03/19 16:21:32 david Exp $");
 
 #define CVS_LOG_BOUNDARY "----------------------------\n"
 #define CVS_FILE_BOUNDARY "=============================================================================\n"
@@ -96,6 +97,7 @@ static int restrict_tag_ps_start;
 static int restrict_tag_ps_end;
 static const char * diff_opts;
 static int bkcvs;
+static int no_rcmds;
 
 static void parse_args(int, char *[]);
 static void load_from_cvs();
@@ -196,7 +198,19 @@ static void load_from_cvs()
     int have_log = 0;
     char cmd[BUFSIZ];
     char date_str[64];
-    int bk_log_border = 1;
+    char use_rep_buff[PATH_MAX];
+    char * ltype;
+
+    if (!no_rcmds && cvs_check_cap(CAP_HAVE_RLOG))
+    {
+	ltype = "rlog";
+	snprintf(use_rep_buff, PATH_MAX, "%s", repository_path);
+    }
+    else
+    {
+	ltype = "log";
+	use_rep_buff[0] = 0;
+    }
 
     if (cache_date > 0)
     {
@@ -212,11 +226,11 @@ static void load_from_cvs()
 	 * which is necessary to fill in the pre_rev stuff for a 
 	 * PatchSetMember
 	 */
-	snprintf(cmd, BUFSIZ, "cvs %s rlog -d '%s<;%s' %s", norc, date_str, date_str, repository_path);
+	snprintf(cmd, BUFSIZ, "cvs %s %s -d '%s<;%s' %s", norc, ltype, date_str, date_str, use_rep_buff);
     }
     else
     {
-	snprintf(cmd, BUFSIZ, "cvs %s rlog %s", norc, repository_path);
+	snprintf(cmd, BUFSIZ, "cvs %s %s %s", norc, ltype, use_rep_buff);
     }
     
     debug(DEBUG_STATUS, "******* USING CMD %s", cmd);
@@ -346,48 +360,7 @@ static void load_from_cvs()
 	    }
 	    break;
 	case NEED_EOM:
-	    /* adaptive crap filter mode (bkcvs only) :-( 
-	     *
-	     * There is no one way to parse the bk-cvs log files.
-	     * There are currently three three known aberrations
-	     * 1) The '(Logical change x.yyyy)' text is missing from
-	     *    the log message.  If this were always there, we 
-	     *    could always use the bk_log_border logic.
-	     * 2) Someone has committed 'cvs log' text into the log.
-	     *    this causes false 'end of log message' detection.
-	     *    We detect this by looking for 'revision %d.%d' 
-	     *    in the log text.
-	     * 3) Like 2) above, but where the very first line is the
-	     *    log separator, so we have no chance to detect 2).
-	     * 
-	     * Handling 2) and 3) is done by detection, then enabling
-	     * bk_log_border mode.  Hopefully there is no combination
-	     * of 1) with 2) or 3) or we are screwed.
-	     */
-	    {
-		int cr1, cr2;
-		if (bkcvs && sscanf(buff, "revision %d.%d", &cr1, &cr2) == 2)
-		    bk_log_border = 0;
-		if (bkcvs && !have_log && strncmp(buff, "----------", 10) == 0)
-		    bk_log_border = 0;
-	    }
-
-	    /* if bk_log_border is 0, we must find bk_log_border first */
-	    if (bkcvs && !bk_log_border)
-	    {
-		char * p = buff; 
-
-		/* deletes have '}' prefixing the logical change string */
-		if (*p == '}') p++;
-
-		if (strcmp(file->filename, "ChangeSet") == 0)
-		    bk_log_border = 1;
-		else if (strncmp(p, "(Logical change", 15) == 0)
-		    bk_log_border = 1;
-	    }
-
-	    /* normal log border detection */
-	    if (strcmp(buff, CVS_LOG_BOUNDARY) == 0 && (!bkcvs || bk_log_border))
+	    if (strcmp(buff, CVS_LOG_BOUNDARY) == 0)
 	    {
 		if (psm)
 		{
@@ -398,7 +371,6 @@ static void load_from_cvs()
 		logbuff[0] = 0;
 		loglen = 0;
 		have_log = 0;
-		bk_log_border = 1;
 		state = NEED_REVISION;
 	    }
 	    else if (strcmp(buff, CVS_FILE_BOUNDARY) == 0)
@@ -413,7 +385,6 @@ static void load_from_cvs()
 		logbuff[0] = 0;
 		loglen = 0;
 		have_log = 0;
-		bk_log_border = 1;
 		psm = NULL;
 		file = NULL;
 		state = NEED_FILE;
@@ -486,13 +457,15 @@ static void usage(const char * str1, const char * str2)
     if (str1)
 	debug(DEBUG_APPERROR, "\nbad usage: %s %s\n", str1, str2);
 
-    debug(DEBUG_APPERROR, "Usage: cvsps [-x] [-u] [-z <fuzz>] [-g] [-s <patchset>] [-a <author>] ");
-    debug(DEBUG_APPERROR, "             [-f <file>] [-d <date1> [-d <date2>]] [-b <branch>]");
-    debug(DEBUG_APPERROR, "             [-l <regex>] [-r <tag> [-r <tag>]] [-p <directory>]");
-    debug(DEBUG_APPERROR, "             [-v] [-h] [-t] [--norc] [--summary-first]");
+    debug(DEBUG_APPERROR, "Usage: cvsps [-h] [-x] [-u] [-z <fuzz>] [-g] [-s <range>[,<range>]]  ");
+    debug(DEBUG_APPERROR, "             [-a <author>] [-f <file>] [-d <date1> [-d <date2>]] ");
+    debug(DEBUG_APPERROR, "             [-b <branch>]  [-l <regex>] [-r <tag> [-r <tag>]] ");
+    debug(DEBUG_APPERROR, "             [-p <directory>] [-v] [-t] [--norc] [--summary-first]");
     debug(DEBUG_APPERROR, "             [--test-log <captured cvs log file>] [--bkcvs]");
+    debug(DEBUG_APPERROR, "             [--no-rcmds] [--diff-opts <option string>]");
     debug(DEBUG_APPERROR, "");
     debug(DEBUG_APPERROR, "Where:");
+    debug(DEBUG_APPERROR, "  -h display this informative message");
     debug(DEBUG_APPERROR, "  -x ignore (and rebuild) cvsps.cache file");
     debug(DEBUG_APPERROR, "  -u update cvsps.cache file");
     debug(DEBUG_APPERROR, "  -z <fuzz> set the timestamp fuzz factor for identifying patch sets");
@@ -509,13 +482,14 @@ static void usage(const char * str1, const char * str2)
     debug(DEBUG_APPERROR, "     revisions since tag1. If two tags specified, show");
     debug(DEBUG_APPERROR, "     revisions between the two tags.");
     debug(DEBUG_APPERROR, "  -p <directory> output patch sets to individual files in <directory>");
-    debug(DEBUG_APPERROR, "  -v show verbose parsing messages");
+    debug(DEBUG_APPERROR, "  -v show very verbose parsing messages");
     debug(DEBUG_APPERROR, "  -t show some brief memory usage statistics");
     debug(DEBUG_APPERROR, "  --norc when invoking cvs, ignore the .cvsrc file");
-    debug(DEBUG_APPERROR, "  -h display this informative message");
     debug(DEBUG_APPERROR, "  --summary-first when multiple patch sets are shown, put all summaries first");
     debug(DEBUG_APPERROR, "  --test-log <captured cvs log> supply a captured cvs log for testing");
+    debug(DEBUG_APPERROR, "  --diff-opts <option string> supply special set of options to diff");
     debug(DEBUG_APPERROR, "  --bkcvs special hack for parsing the BK -> CVS log format");
+    debug(DEBUG_APPERROR, "  --no-rcmds disable rlog and rdiff (they're faulty in some setups)");
     debug(DEBUG_APPERROR, "\ncvsps version %s\n", VERSION);
 
     exit(1);
@@ -731,7 +705,14 @@ static void parse_args(int argc, char *argv[])
 	    i++;
 	    continue;
 	}
-	
+
+	if (strcmp(argv[i], "--no-rcmds") == 0)
+	{
+	    no_rcmds = 1;
+	    i++;
+	    continue;
+	}
+
 	usage("invalid argument", argv[i]);
     }
 }
@@ -1398,21 +1379,24 @@ static void do_cvs_diff(PatchSet * ps)
     struct list_head * next;
     const char * dtype;
     const char * dopts;
+    const char * utype;
     char use_rep_path[PATH_MAX];
 
     fflush(stdout);
     fflush(stderr);
 
-    if (diff_opts == NULL) 
+    if (!no_rcmds && diff_opts == NULL) 
     {
 	dopts = "-u";
 	dtype = "rdiff";
+	utype = "co";
 	sprintf(use_rep_path, "%s/", repository_path);
     }
     else
     {
-	dopts = diff_opts;
+	dopts = diff_opts ? diff_opts : "-u";
 	dtype = "diff";
+	utype = "update";
 	use_rep_path[0] = 0;
     }
 
@@ -1440,23 +1424,36 @@ static void do_cvs_diff(PatchSet * ps)
 	    continue;
 	}
 
+	/* 
+	 * When creating diffs for INITIAL or DEAD revisions, we have to use 'cvs co'
+	 * or 'cvs update' to get the file, because cvs won't generate these diffs.
+	 * The problem is that this must be piped to diff, and so the resulting
+	 * diff doesn't contain the filename anywhere! (diff between - and /dev/null).
+	 * sed is used to replace the '-' with the filename. 
+	 */
+
 	/*
 	 * It's possible for pre_rev to be a 'dead' revision.
-	 * this happens when a file is added on a branch
+	 * this happens when a file is added on a branch.
 	 */
 	if (!psm->pre_rev || psm->pre_rev->dead)
 	{
-	    snprintf(cmdbuff, PATH_MAX * 2, "cvs %s update -p -r %s %s | diff %s /dev/null - | sed -e '1 s|^--- /dev/null|--- %s|g' -e '2 s|^+++ -|+++ %s|g'",
-		     norc, psm->post_rev->rev, psm->file->filename, dopts, psm->file->filename, psm->file->filename);
+	    /* a 'create file' diff */
+	    snprintf(cmdbuff, PATH_MAX * 2, "cvs %s %s -p -r %s %s%s | diff %s /dev/null - | sed -e '2 s|^+++ -|+++ %s%s|g'",
+		     norc, utype, psm->post_rev->rev, use_rep_path, psm->file->filename, dopts, 
+		     use_rep_path, psm->file->filename);
 	}
 	else if (psm->post_rev->dead)
 	{
-	    snprintf(cmdbuff, PATH_MAX * 2, "cvs %s update -p -r %s %s | diff %s - /dev/null | sed -e '1 s|^--- -|--- %s|g' -e '2 s|^+++ /dev/null|+++ %s|g'",
-		     norc, psm->pre_rev->rev, psm->file->filename, dopts, psm->file->filename, psm->file->filename);
+	    /* a 'remove file' diff */
+	    snprintf(cmdbuff, PATH_MAX * 2, "cvs %s %s -p -r %s %s%s | diff %s - /dev/null | sed -e '1 s|^--- -|--- %s%s|g'",
+		     norc, utype, psm->pre_rev->rev, use_rep_path, psm->file->filename, dopts, 
+		     use_rep_path, psm->file->filename);
 	    
 	}
 	else
 	{
+	    /* a regular diff */
 	    snprintf(cmdbuff, PATH_MAX * 2, "cvs %s %s %s -r %s -r %s %s%s",
 		     norc, dtype, dopts, psm->pre_rev->rev, psm->post_rev->rev, use_rep_path, psm->file->filename);
 	}
@@ -1490,6 +1487,8 @@ CvsFileRevision * cvs_file_add_revision(CvsFile * file, const char * rev_str)
 	rev = (CvsFileRevision*)calloc(1, sizeof(*rev));
 	rev->rev = get_string(rev_str);
 	rev->file = file;
+	rev->branch = NULL;
+	rev->present = 0;
 	rev->pre_psm = NULL;
 	rev->post_psm = NULL;
 	INIT_LIST_HEAD(&rev->branch_children);
@@ -1514,6 +1513,12 @@ CvsFileRevision * cvs_file_add_revision(CvsFile * file, const char * rev_str)
     if (!rev->branch && file->have_branches)
     {
 	char branch_str[REV_STR_MAX];
+
+	/* in the cvs cvs repository (ccvs) there are tagged versions
+	 * that don't exist.  let's mark every 'known to exist' 
+	 * version
+	 */
+	rev->present = 1;
 
 	/* determine the branch this revision was committed on */
 	if (!get_branch(branch_str, rev->rev))
@@ -1779,6 +1784,17 @@ static void resolve_global_symbols()
 	{
 	    Tag * tag = list_entry(next, Tag, global_link);
 	    CvsFileRevision * rev = tag->rev;
+
+	    if (!rev->present)
+	    {
+		struct list_head *tmp = next->prev;
+		debug(DEBUG_APPERROR, "revision %s of file %s is tagged but not present",
+		      rev->rev, rev->file->filename);
+		/* FIXME: memleak */
+		list_del(next);
+		next = tmp;
+		continue;
+	    }
 
 	    ps = rev->post_psm->ps;
 

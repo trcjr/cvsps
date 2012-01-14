@@ -1,5 +1,5 @@
 MAJOR=2
-MINOR=0b4
+MINOR=0b5
 CC?=gcc
 CFLAGS?=-g -O2 -Wall 
 CFLAGS+=-I. -DVERSION=\"$(MAJOR).$(MINOR)\"
@@ -11,7 +11,8 @@ OBJS=\
 	cvsps.o\
 	cache.o\
 	util.o\
-	stats.o
+	stats.o\
+	cap.o
 
 all: cvsps
 
