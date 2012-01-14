@@ -1,7 +1,9 @@
 MAJOR=1
-MINOR=3
-CC=gcc
-CFLAGS=-g -O2 -Wall -I. -DVERSION=\"$(MAJOR).$(MINOR)\"
+MINOR=3.1
+CC?=gcc
+CFLAGS?=-g -O2 -Wall 
+CFLAGS+=-I. -DVERSION=\"$(MAJOR).$(MINOR)\"
+prefix?=/usr/local
 OBJS=\
 	cbtcommon/debug.o\
 	cbtcommon/hash.o\
@@ -9,13 +11,13 @@ OBJS=\
 	cvsps.o
 
 cvsps: $(OBJS)
-	gcc -o cvsps $(OBJS)
+	$(CC) -o cvsps $(OBJS)
 
 install:
-	[ -d /usr/local/bin ] || mkdir -p /usr/local/bin
-	[ -d /usr/local/man/man1 ] || mkdir -p /usr/local/man/man1
-	install cvsps /usr/local/bin
-	install -m 644 cvsps.1 /usr/local/man/man1
+	[ -d $(prefix)/bin ] || mkdir -p $(prefix)/bin
+	[ -d $(prefix)/man/man1 ] || mkdir -p $(prefix)/man/man1
+	install cvsps $(prefix)/bin
+	install -m 644 cvsps.1 $(prefix)/man/man1
 
 clean:
 	rm -f cvsps *.o cbtcommon/*.o core

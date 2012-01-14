@@ -17,7 +17,7 @@
 #include <cbtcommon/debug.h>
 #include <cbtcommon/rcsid.h>
 
-RCSID("$Id: cvsps.c,v 4.24 2001/12/07 16:32:09 david Exp $");
+RCSID("$Id: cvsps.c,v 4.24.2.3 2002/06/13 16:06:58 david Exp $");
 
 #define LOG_STR_MAX 8192
 #define AUTH_STR_MAX 64
@@ -116,8 +116,21 @@ int main(int argc, char *argv[])
     file_hash = create_hash_table(1023);
 
     if (!ignore_cache)
+    {
+	int save_fuzz_factor = timestamp_fuzz_factor;
+
+	/* the timestamp fuzz should only be in effect when loading from
+	 * CVS, not re-fuzzed when loading from cache.  This is a hack
+	 * working around bad use of global variables
+	 */
+
+	timestamp_fuzz_factor = 0;
+
 	if (read_cache() < 0)
 	    update_cache = 1;
+
+	timestamp_fuzz_factor = save_fuzz_factor;
+    }
     
     if (update_cache)
     {
@@ -217,8 +230,12 @@ static void load_from_cvs()
 		 * (psm refers to last patch set processed at this point)
 		 * since generally speaking the log is reverse chronological.
 		 * This breaks down slightly when branches are introduced 
+		 *
+		 * Use new_rev instead of rev, since rev will be NULL for
+		 * existing revisions (i.e. cvsps -u).  assign_pre_revision
+		 * does hash lookup on new_rev to get actual rev str anyway
 		 */
-		assign_pre_revision(psm, rev);
+		assign_pre_revision(psm, new_rev);
 
 		if (rev)
 		{
@@ -501,9 +518,6 @@ static void init_strip_path()
         strip_path_len = snprintf(strip_path, PATH_MAX, "%s/", rep_buff);
     else
         strip_path_len = snprintf(strip_path, PATH_MAX, "%s/%s/", p, rep_buff);
-
-
-    strip_path_len = snprintf(strip_path, PATH_MAX, "%s/%s/", p, rep_buff);
 
     if (strip_path_len < 0)
     {
