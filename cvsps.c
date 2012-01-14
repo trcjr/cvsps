@@ -1,5 +1,5 @@
 /*
- * Copyright 2001 David Mansfield and Cobite, Inc.
+ * Copyright 2001, 2002 David Mansfield and Cobite, Inc.
  * See COPYING file for license information 
  */
 
@@ -17,7 +17,7 @@
 #include <cbtcommon/debug.h>
 #include <cbtcommon/rcsid.h>
 
-RCSID("$Id: cvsps.c,v 4.24.2.3 2002/06/13 16:06:58 david Exp $");
+RCSID("$Id: cvsps.c,v 4.24.2.4 2002/07/01 22:36:05 david Exp $");
 
 #define LOG_STR_MAX 8192
 #define AUTH_STR_MAX 64
@@ -62,6 +62,13 @@ typedef struct _PatchSetMember
     struct list_head link;
 } PatchSetMember;
 
+typedef struct _PatchSetRange
+{
+    int min_counter;
+    int max_counter;
+    struct list_head link;
+} PatchSetRange;
+
 static int ps_counter;
 static struct hash_table * file_hash;
 static void * ps_tree;
@@ -71,7 +78,7 @@ static const char * restrict_file;
 static time_t restrict_date_start;
 static time_t restrict_date_end;
 static const char * restrict_branch;
-static int show_patch_set;
+static struct list_head show_patch_set_ranges;
 static char strip_path[PATH_MAX];
 static int strip_path_len;
 static time_t cache_date;
@@ -103,6 +110,7 @@ static int read_cache();
 static CvsFile * create_cvsfile();
 static PatchSet * create_patchset();
 static PatchSetMember * create_patchset_member();
+static PatchSetRange * create_patchset_range();
 static void parse_cache_revision(PatchSetMember *, const char *);
 static char * file_get_revision(CvsFile *, const char *);
 static void parse_sym(CvsFile *, char *);
@@ -111,6 +119,8 @@ static char * cvs_file_add_branch(CvsFile *, const char *, const char *);
 int main(int argc, char *argv[])
 {
     debuglvl = DEBUG_APPERROR|DEBUG_SYSERROR;
+
+    INIT_LIST_HEAD(&show_patch_set_ranges);
 
     parse_args(argc, argv);
     file_hash = create_hash_table(1023);
@@ -390,10 +400,34 @@ static void parse_args(int argc, char *argv[])
 	
 	if (strcmp(argv[i], "-s") == 0)
 	{
+	    PatchSetRange * range;
+	    char * min_str, * max_str;
+
 	    if (++i >= argc)
 		usage("argument to -s missing", "");
 
-	    show_patch_set = atoi(argv[i++]);
+	    min_str = strtok(argv[i++], ",");
+	    do
+	    {
+		range = create_patchset_range();
+
+		max_str = strrchr(min_str, '-');
+		if (max_str)
+		    *max_str++ = '\0';
+		else
+		    max_str = min_str;
+
+		range->min_counter = atoi(min_str);
+
+		if (*max_str)
+		    range->max_counter = atoi(max_str);
+		else
+		    range->max_counter = INT_MAX;
+
+		list_add(&range->link, show_patch_set_ranges.prev);
+	    }
+	    while ((min_str = strtok(NULL, ",")));
+
 	    continue;
 	}
 	
@@ -783,18 +817,26 @@ static void show_ps_tree_node(const void * nodep, const VISIT which, const int d
 	ps = *(PatchSet**)nodep;
 	ps_counter++;
 
-	if (show_patch_set > 0)
+	if (!list_empty(&show_patch_set_ranges))
 	{
-	    if (ps_counter == show_patch_set)
-	    {
-		print_patch_set(ps);
-		do_cvs_diff(ps);
-		exit(0);
-	    }
-	    break;
-	}
+	    struct list_head * next = show_patch_set_ranges.next;
 
-	check_print_patch_set(ps);
+	    while (next != &show_patch_set_ranges)
+	    {
+		PatchSetRange *range = list_entry(next, PatchSetRange, link);
+		if (range->min_counter <= ps_counter &&
+		    ps_counter <= range->max_counter)
+		{
+			print_patch_set(ps);
+			do_cvs_diff(ps);
+		}
+		next = next->next;
+	    }
+	}
+	else
+	{
+	    check_print_patch_set(ps);
+	}
 	break;
 
     default:
@@ -1304,6 +1346,12 @@ static PatchSetMember * create_patchset_member()
     psm->pre_rev = "UNKNOWN";
     psm->post_rev = "UNKNOWN";
     return psm;
+}
+
+static PatchSetRange * create_patchset_range()
+{
+    PatchSetRange * psr = (PatchSetRange*)calloc(1, sizeof(*psr));
+    return psr;
 }
 
 static void parse_cache_revision(PatchSetMember * psm, const char * buff)

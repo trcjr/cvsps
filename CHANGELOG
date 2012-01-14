@@ -1,3 +1,7 @@
+1.3.2 (small feature release)
+- added the 'multi-patchset' feature to the -s option, provided in its
+  entirety by Daiki Ueno <ueno@unixuser.org>
+
 1.3.1 (bugfix release mostly)
 - fix bug with updating cache (-u) having to do with matching new and old 
   revisions
