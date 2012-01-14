@@ -16,7 +16,7 @@
 #include <windows.h>
 #endif
 
-RCSID("$Id: debug.c,v 1.13 2001/10/25 18:36:10 adam Exp $");
+RCSID("$Id: debug.c,v 1.14 2001/11/29 00:00:30 amb Exp $");
 
 unsigned int debuglvl = ~0;
 static FILE *debug_output_channel[DEBUG_NUM_FACILITIES];
@@ -61,7 +61,7 @@ void vdebug(int dtype, const char *fmt, va_list ap)
 	  const char * errmsg = "";
 
 #ifndef MACINTOSH
-	  errmsg = sys_errlist[errno];
+	  errmsg = strerror(errno);
 #endif
 
 	  fprintf(channel, "%s: %s\n", msgbuff, errmsg);

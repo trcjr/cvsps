@@ -6,7 +6,7 @@
 #ifndef UTIL_INLINE_H
 #define UTIL_INLINE_H
 
-#ifdef unix
+#ifdef __GNUC__
 #define INLINE __inline__
 #endif
 
@@ -14,7 +14,9 @@
 #define INLINE __inline
 #endif
 
-#ifdef MACINTOSH
+/* INLINE of last resort... heh */
+
+#ifndef INLINE
 #define INLINE /* void */
 #endif
 

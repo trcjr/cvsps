@@ -17,7 +17,7 @@
 #include <cbtcommon/debug.h>
 #include <cbtcommon/rcsid.h>
 
-RCSID("$Id: cvsps.c,v 4.19 2001/11/26 22:31:21 david Exp $");
+RCSID("$Id: cvsps.c,v 4.23 2001/12/05 21:17:32 david Exp $");
 
 #define LOG_STR_MAX 8192
 #define AUTH_STR_MAX 64
@@ -161,7 +161,7 @@ static void load_from_cvs()
 	 * which is necessary to fill in the pre_rev stuff for a 
 	 * PatchSetMember
 	 */
-	sprintf(cmd, "cvs log -d '%s<;%s'", date_str, date_str);
+	snprintf(cmd, BUFSIZ, "cvs log -d '%s<;%s'", date_str, date_str);
     }
     else
     {
@@ -175,7 +175,7 @@ static void load_from_cvs()
 
     if (!cvsfp)
     {
-	perror("can't open cvs pipe\n");
+	debug(DEBUG_SYSERROR, "can't open cvs pipe using command %s", cmd);
 	exit(1);
     }
     
@@ -335,13 +335,16 @@ static void load_from_cvs()
 
 static void usage(const char * str1, const char * str2)
 {
-    debug(DEBUG_APPERROR, "\nbad usage: %s %s\n", str1, str2);
+    if (str1)
+	debug(DEBUG_APPERROR, "\nbad usage: %s %s\n", str1, str2);
+
     debug(DEBUG_APPERROR, "Usage: cvsps [-x] [-u] [-z <fuzz>] [-s <patchset>] [-a <author>] ");
-    debug(DEBUG_APPERROR, "             [-f <file>] [-d <date1> [-d <date2>]] [-b <branch>] [-v]");
+    debug(DEBUG_APPERROR, "             [-f <file>] [-d <date1> [-d <date2>]] [-b <branch>]");
+    debug(DEBUG_APPERROR, "             [-v] [-h]");
     debug(DEBUG_APPERROR, "");
     debug(DEBUG_APPERROR, "Where:");
-    debug(DEBUG_APPERROR, "  -x ignore (and rebuild) cvsps.cache file");
-    debug(DEBUG_APPERROR, "  -u update cvsps.cache file");
+    debug(DEBUG_APPERROR, "  -x ignore (and rebuild) CVS/cvsps.cache file");
+    debug(DEBUG_APPERROR, "  -u update CVS/cvsps.cache file");
     debug(DEBUG_APPERROR, "  -z <fuzz> set the timestamp fuzz factor for identifying patch sets");
     debug(DEBUG_APPERROR, "  -s <patchset> generate a diff for a given patchset");
     debug(DEBUG_APPERROR, "  -a <author> restrict output to patchsets created by author");
@@ -351,6 +354,7 @@ static void usage(const char * str1, const char * str2)
     debug(DEBUG_APPERROR, "     show revisions between two dates.");
     debug(DEBUG_APPERROR, "  -b <branch> restrict output to patchsets affecting history of branch");
     debug(DEBUG_APPERROR, "  -v show verbose parsing messages");
+    debug(DEBUG_APPERROR, "  -h display this informative this message");
     debug(DEBUG_APPERROR, "\ncvsps version %s\n", VERSION);
 
     exit(1);
@@ -440,6 +444,9 @@ static void parse_args(int argc, char *argv[])
 	    continue;
 	}
 	
+	if (strcmp(argv[i], "-h") == 0)
+	    usage(NULL, NULL);
+
 	usage("invalid argument", argv[i]);
     }
 }
@@ -877,32 +884,42 @@ static int patch_set_affects_branch(PatchSet * ps, const char * branch)
     while (next != &ps->members)
     {
 	PatchSetMember * psm = list_entry(next, PatchSetMember, link);
-	char * branch_rev = (char*)get_hash_object(psm->file->branches_sym, branch);
-	
-	if (branch_rev)
+
+	/* special case the branch called 'TRUNK' */
+	if (strcmp(branch, "TRUNK") == 0)
 	{
-	    char post_rev[REV_STR_MAX];
-	    char branch[REV_STR_MAX];
-	    int file_leaf, branch_leaf;
-
-	    strcpy(branch, branch_rev);
-
-	    /* first get the branch the file rev is on */
-	    if (get_branch_ext(post_rev, psm->post_rev, &file_leaf))
+	    char * p = strchr(psm->post_rev, '.');
+	    if (p && !strchr(p + 1, '.'))
+		return 1;
+	}
+	else
+	{
+	    char * branch_rev = (char*)get_hash_object(psm->file->branches_sym, branch);
+	    
+	    if (branch_rev)
 	    {
-		branch_leaf = file_leaf;
-
-		/* check against branch and all branch ancestor branches */
-		do 
+		char post_rev[REV_STR_MAX];
+		char branch[REV_STR_MAX];
+		int file_leaf, branch_leaf;
+		
+		strcpy(branch, branch_rev);
+		
+		/* first get the branch the file rev is on */
+		if (get_branch_ext(post_rev, psm->post_rev, &file_leaf))
 		{
-		    debug(DEBUG_STATUS, "check %s against %s for %s", branch, post_rev, psm->file->filename);
-		    if (strcmp(branch, post_rev) == 0)
-			return (file_leaf <= branch_leaf);
+		    branch_leaf = file_leaf;
+		    
+		    /* check against branch and all branch ancestor branches */
+		    do 
+		    {
+			debug(DEBUG_STATUS, "check %s against %s for %s", branch, post_rev, psm->file->filename);
+			if (strcmp(branch, post_rev) == 0)
+			    return (file_leaf <= branch_leaf);
+		    }
+		    while(get_branch_ext(branch, branch, &branch_leaf));
 		}
-		while(get_branch_ext(branch, branch, &branch_leaf));
 	    }
 	}
-	
 	next = next->next;
     }
 
@@ -956,9 +973,9 @@ static void write_cache()
 
     ps_counter = 0;
 
-    if ((cache_fp = fopen("cvsps.cache", "w")) == NULL)
+    if ((cache_fp = fopen("CVS/cvsps.cache", "w")) == NULL)
     {
-	debug(DEBUG_SYSERROR, "can't open cvsps.cache for write");
+	debug(DEBUG_SYSERROR, "can't open CVS/cvsps.cache for write");
 	return;
     }
 
@@ -1088,13 +1105,13 @@ static int read_cache()
     authbuff[0] = 0;
     logbuff[0] = 0;
 
-    if (!(fp = fopen("cvsps.cache", "r")))
+    if (!(fp = fopen("CVS/cvsps.cache", "r")))
 	return -1;
 
     /* first line is date cache was created, format "cache date: %d\n" */
     if (!fgets(buff, BUFSIZ, fp) || strncmp(buff, "cache date:", 11))
     {
-	debug(DEBUG_APPERROR, "bad cvsps.cache file");
+	debug(DEBUG_APPERROR, "bad CVS/cvsps.cache file");
 	return -1;
     }
 
@@ -1378,3 +1395,4 @@ static char * cvs_file_add_branch(CvsFile * file, const char * rev, const char *
     
     return new_tag;
 }
+
