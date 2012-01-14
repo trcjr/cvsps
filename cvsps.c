@@ -32,7 +32,7 @@
 #include "cvs_direct.h"
 #include "list_sort.h"
 
-RCSID("$Id: cvsps.c,v 4.106 2005/05/26 03:39:29 david Exp $");
+RCSID("$Id: cvsps.c,v 4.108 2005/06/05 22:52:43 david Exp $");
 
 #define CVS_LOG_BOUNDARY "----------------------------\n"
 #define CVS_FILE_BOUNDARY "=============================================================================\n"
@@ -84,6 +84,7 @@ static const char * test_log_file;
 static struct hash_table * branch_heads;
 static struct list_head all_patch_sets;
 static struct list_head collisions;
+static struct hash_table * branches;
 
 /* settable via options */
 static int timestamp_fuzz_factor = 300;
@@ -145,6 +146,8 @@ static CvsFileRevision * rev_follow_branch(CvsFileRevision *, const char *);
 static int before_tag(CvsFileRevision * rev, const char * tag);
 static void determine_branch_ancestor(PatchSet * ps, PatchSet * head_ps);
 static void handle_collisions();
+static Branch * create_branch(const char * name) ;
+static void find_branch_points(PatchSet * ps);
 
 int main(int argc, char *argv[])
 {
@@ -179,6 +182,7 @@ int main(int argc, char *argv[])
     file_hash = create_hash_table(1023);
     global_symbols = create_hash_table(111);
     branch_heads = create_hash_table(1023);
+    branches = create_hash_table(1023);
     INIT_LIST_HEAD(&all_patch_sets);
     INIT_LIST_HEAD(&collisions);
 
@@ -263,7 +267,7 @@ static void load_from_cvs()
     int state = NEED_FILE;
     CvsFile * file = NULL;
     PatchSetMember * psm = NULL;
-    char datebuff[20];
+    char datebuff[26];
     char authbuff[AUTH_STR_MAX];
     char logbuff[LOG_STR_MAX + 1];
     int loglen = 0;
@@ -412,8 +416,8 @@ static void load_from_cvs()
 	    {
 		char * p;
 
-		strncpy(datebuff, buff + 6, 19);
-		datebuff[19] = 0;
+		strncpy(datebuff, buff + 6, sizeof(datebuff));
+		datebuff[sizeof(datebuff)-1] = 0;
 
 		strcpy(authbuff, "unknown");
 		p = strstr(buff, "author: ");
@@ -483,6 +487,7 @@ static void load_from_cvs()
 		    /* if the log buffer is full, that's it.  
 		     * 
 		     * Also, read lines (fgets) always have \n in them
+		     * (unless truncation happens)
 		     * which we count on.  So if truncation happens,
 		     * be careful to put a \n on.
 		     * 
@@ -1440,7 +1445,6 @@ static void print_patch_set(PatchSet * ps)
     const char * funk = "";
 
     tm = localtime(&ps->date);
-    next = ps->members.next;
     
     funk = fnk_descr[ps->funk_factor];
     
@@ -1455,9 +1459,18 @@ static void print_patch_set(PatchSet * ps)
     if (ps->ancestor_branch)
 	printf("Ancestor branch: %s\n", ps->ancestor_branch);
     printf("Tag: %s %s\n", ps->tag ? ps->tag : "(none)", tag_flag_descr[ps->tag_flags]);
+    printf("Branches: ");
+    for (next = ps->branches.next; next != &ps->branches; next = next->next) {
+	Branch * branch = list_entry(next, Branch, link);
+	if (next != ps->branches.next)
+	    printf(",");
+	printf("%s", branch->name);
+    }
+    printf("\n");
     printf("Log:\n%s\n", ps->descr);
     printf("Members: \n");
 
+    next = ps->members.next;
     while (next != &ps->members)
     {
 	PatchSetMember * psm = list_entry(next, PatchSetMember, link);
@@ -1505,6 +1518,9 @@ static void assign_patchset_id(PatchSet * ps)
 	    
 	    determine_branch_ancestor(ps, head_ps);
 	}
+
+	find_branch_points(ps);
+
     }
     else
     {
@@ -2018,6 +2034,7 @@ static PatchSet * create_patch_set()
     if (ps)
     {
 	INIT_LIST_HEAD(&ps->members);
+	INIT_LIST_HEAD(&ps->branches);
 	ps->psid = -1;
 	ps->date = 0;
 	ps->min_date = 0;
@@ -2188,6 +2205,13 @@ char * cvs_file_add_branch(CvsFile * file, const char * rev, const char * tag)
     put_hash_object_ex(file->branches, new_rev, new_tag, HT_NO_KEYCOPY, NULL, NULL);
     put_hash_object_ex(file->branches_sym, new_tag, new_rev, HT_NO_KEYCOPY, NULL, NULL);
     
+    if (get_hash_object(branches, tag) == NULL) {
+	debug(DEBUG_STATUS, "adding new branch to branches hash: %s", tag);
+	Branch * branch = create_branch(tag);
+	put_hash_object_ex(branches, new_tag, branch, HT_NO_KEYCOPY, NULL, NULL);
+    }
+    
+
     return new_tag;
 }
 
@@ -2616,4 +2640,48 @@ void walk_all_patch_sets(void (*action)(PatchSet *))
 	PatchSet * ps = list_entry(next, PatchSet, all_link);
 	action(ps);
     }
+}
+
+static Branch * create_branch(const char * name) 
+{
+    Branch * branch = (Branch*)calloc(1, sizeof(*branch));
+    branch->name = get_string(name);
+    branch->ps = NULL;
+    CLEAR_LIST_NODE(&branch->link);
+    return branch;
+}
+
+static void find_branch_points(PatchSet * ps)
+{
+    struct list_head * next;
+    
+    /*
+     * for each member, check if the post-rev has any branch children.
+     * if so, the branch point for that branch cannot be earlier than this 
+     * PatchSet, so just assign here for now.  It'll get pushed ahead
+     * bit by bit until it falls into the right place.
+     */
+    for (next = ps->members.next; next != &ps->members; next = next->next) 
+    {
+	PatchSetMember * psm = list_entry(next, PatchSetMember, link);
+	CvsFileRevision * rev = psm->post_rev;
+	struct list_head * child_iter;
+
+	for (child_iter = rev->branch_children.next; child_iter != &rev->branch_children; child_iter = child_iter->next) {
+	    CvsFileRevision * branch_child = list_entry(child_iter, CvsFileRevision, link);
+	    Branch * branch = get_hash_object(branches, branch_child->branch);
+	    if (branch == NULL) {
+		debug(DEBUG_APPERROR, "branch %s not found in global branch hash", branch_child->branch);
+		return;
+	    }
+	    
+	    if (branch->ps != NULL) {
+		list_del(&branch->link);
+	    }
+
+	    branch->ps = ps;
+	    list_add(&branch->link, ps->branches.prev);
+	}
+    }
+	
 }

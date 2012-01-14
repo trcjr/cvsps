@@ -1,4 +1,4 @@
-Version: 2.1
+Version: 2.2b1
 Summary: CVSps is a program for generating 'patchset' information from a CVS repository
 Name: cvsps
 Release: 1
@@ -35,7 +35,7 @@ rm -rf $RPM_BUILD_ROOT
 %defattr(-,root,root)
 %doc README CHANGELOG COPYING
 %{prefix}/bin/cvsps
-%{prefix}/man/man*/*
+%{prefix}/share/man/man*/*
 
 %changelog
 * Tue Apr  1 2002 David Mansfield <cvsps@dm.cobite.com>

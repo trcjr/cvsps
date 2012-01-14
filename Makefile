@@ -1,5 +1,5 @@
 MAJOR=2
-MINOR=1
+MINOR=2b1
 CC?=gcc
 CFLAGS?=-g -O2 -Wall 
 CFLAGS+=-I. -DVERSION=\"$(MAJOR).$(MINOR)\"
@@ -18,7 +18,7 @@ OBJS=\
 	cvs_direct.o\
 	list_sort.o
 
-all: cvsps
+all: cvsps 
 
 cvsps: $(OBJS)
 	$(CC) -o cvsps $(OBJS) -lz

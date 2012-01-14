@@ -144,17 +144,21 @@ char *get_string(char const *str)
 static int get_int_substr(const char * str, const regmatch_t * p)
 {
     char buff[256];
+    if(p->rm_so == -1)
+	    return 0;
+    if(p->rm_eo - p->rm_so >= sizeof(buff))
+	    return 0;
     memcpy(buff, str + p->rm_so, p->rm_eo - p->rm_so);
     buff[p->rm_eo - p->rm_so] = 0;
     return atoi(buff);
 }
 
-static time_t mktime_utc(struct tm * tm)
+static time_t mktime_utc(struct tm * tm, const char* tzbuf)
 {
     char * old_tz = getenv("TZ");
     time_t ret;
 
-    setenv("TZ", "UTC", 1);
+    setenv("TZ", tzbuf, 1);
 
     tzset();
 	    
@@ -181,7 +185,7 @@ void convert_date(time_t * t, const char * dte)
 
     if (!init_re) 
     {
-	if (regcomp(&date_re, "([0-9]{4})[-/]([0-9]{2})[-/]([0-9]{2}) ([0-9]{2}):([0-9]{2}):([0-9]{2})", REG_EXTENDED)) 
+	if (regcomp(&date_re, "([0-9]{4})[-/]([0-9]{2})[-/]([0-9]{2}) ([0-9]{2}):([0-9]{2}):([0-9]{2})( [-+][0-9]{4})?", REG_EXTENDED)) 
 	{
 	    fprintf(stderr, "FATAL: date regex compilation error\n");
 	    exit(1);
@@ -193,6 +197,8 @@ void convert_date(time_t * t, const char * dte)
     {
 	regmatch_t * pm = match;
 	struct tm tm = {0};
+	char tzbuf[32];
+	int offseth = 0, offsetm = 0;
 
 	/* first regmatch_t is match location of entire re */
 	pm++;
@@ -203,11 +209,17 @@ void convert_date(time_t * t, const char * dte)
 	tm.tm_hour = get_int_substr(dte, pm++);
 	tm.tm_min  = get_int_substr(dte, pm++);
 	tm.tm_sec  = get_int_substr(dte, pm++);
+	offseth    = -get_int_substr(dte, pm++);
+
+	offsetm= offseth%100;
+	if(offsetm<0) offsetm*=-1;
+	offseth/=100;
+	snprintf(tzbuf, sizeof(tzbuf), "UTC%+d:%d", offseth, offsetm);
 
 	tm.tm_year -= 1900;
 	tm.tm_mon--;
 
-	*t = mktime_utc(&tm);
+	*t = mktime_utc(&tm, tzbuf);
     }
     else
     {
@@ -288,4 +300,19 @@ int escape_filename(char * dst, int len, const char * src)
     }
 
     return (*src == 0) ? 0 : -1;
+}
+
+void strcpy_a(char * dst, const char * src, int n)
+{
+    /* place a 'sentinel' char in final place in buffer 
+     * if strncpy expires the avail. space, this char.
+     * will no longer be \0
+     */
+    dst[n - 1] = 0;
+    strncpy(dst, src, n);
+
+    if (dst[n - 1] != 0) {
+	debug(DEBUG_APPERROR, "FATAL: internal buffer exhausted.");
+	exit(1);
+    }
 }
