@@ -1,5 +1,5 @@
 MAJOR=1
-MINOR=2
+MINOR=3
 CC=gcc
 CFLAGS=-g -O2 -Wall -I. -DVERSION=\"$(MAJOR).$(MINOR)\"
 OBJS=\
