@@ -31,7 +31,7 @@
 #include "cap.h"
 #include "cvs_direct.h"
 
-RCSID("$Id: cvsps.c,v 4.89 2003/03/27 15:21:23 david Exp $");
+RCSID("$Id: cvsps.c,v 4.95 2003/04/03 19:48:02 david Exp $");
 
 #define CVS_LOG_BOUNDARY "----------------------------\n"
 #define CVS_FILE_BOUNDARY "=============================================================================\n"
@@ -107,6 +107,7 @@ static int cvs_direct;
 static int compress;
 static char compress_arg[8];
 
+static void check_norc(int, char *[]);
 static int parse_args(int, char *[]);
 static int parse_rc();
 static void load_from_cvs();
@@ -142,10 +143,18 @@ int main(int argc, char *argv[])
 
     INIT_LIST_HEAD(&show_patch_set_ranges);
 
-    if (parse_args(argc, argv) < 0)
-	exit(1);
+    /*
+     * we want to parse the rc first, so command line can override it
+     * but also, --norc should stop the rc from being processed, so
+     * we look for --norc explicitly first.  Note: --norc in the rc 
+     * file itself will prevent the cvs rc file from being used.
+     */
+    check_norc(argc, argv);
 
     if (strlen(norc) == 0 && parse_rc() < 0)
+	exit(1);
+
+    if (parse_args(argc, argv) < 0)
 	exit(1);
 
     if (diff_opts && !cvs_direct && do_diff)
@@ -452,7 +461,7 @@ static void load_from_cvs()
 			
 			if (len >= LOG_STR_MAX - loglen)
 			{
-			    debug(DEBUG_APPERROR, "WARNING: maximum log length exceeded, truncating log");
+			    debug(DEBUG_APPMSG1, "WARNING: maximum log length exceeded, truncating log");
 			    len = LOG_STR_MAX - loglen;
 			    buff[len - 1] = '\n';
 			}
@@ -517,7 +526,7 @@ static int usage(const char * str1, const char * str2)
     debug(DEBUG_APPERROR, "             [--test-log <captured cvs log file>] [--bkcvs]");
     debug(DEBUG_APPERROR, "             [--no-rlog] [--diff-opts <option string>] [--cvs-direct]");
     debug(DEBUG_APPERROR, "             [--debuglvl <bitmask>] [-Z <compression>] [--root <cvsroot>]");
-    debug(DEBUG_APPERROR, "             [<repository>]");
+    debug(DEBUG_APPERROR, "             [<repository>] [-q]");
     debug(DEBUG_APPERROR, "");
     debug(DEBUG_APPERROR, "Where:");
     debug(DEBUG_APPERROR, "  -h display this informative message");
@@ -545,10 +554,11 @@ static int usage(const char * str1, const char * str2)
     debug(DEBUG_APPERROR, "  --diff-opts <option string> supply special set of options to diff");
     debug(DEBUG_APPERROR, "  --bkcvs special hack for parsing the BK -> CVS log format");
     debug(DEBUG_APPERROR, "  --no-rlog disable rlog (it's faulty in some setups)");
-    debug(DEBUG_APPERROR, "  --cvs-direct enable built-in cvs client code");
+    debug(DEBUG_APPERROR, "  --cvs-direct (--no-cvs-direct) enable (disable) built-in cvs client code");
     debug(DEBUG_APPERROR, "  --debuglvl <bitmask> enable various debug channels.");
     debug(DEBUG_APPERROR, "  -Z <compression> A value 1-9 which specifies amount of compression");
     debug(DEBUG_APPERROR, "  --root <cvsroot> specify cvsroot.  overrides env. and working directory");
+    debug(DEBUG_APPERROR, "  -q be quiet about warnings");
     debug(DEBUG_APPERROR, "  <repository> apply cvsps to repository.  overrides working directory");
     debug(DEBUG_APPERROR, "\ncvsps version %s\n", VERSION);
 
@@ -707,7 +717,7 @@ static int parse_args(int argc, char *argv[])
 	     * go away as TRUNK may be a valid branch within CVS
 	     */
 	    if (strcmp(restrict_branch, "TRUNK") == 0)
-		debug(DEBUG_APPERROR, "Warning: The HEAD branch of CVS is called HEAD, not TRUNK");
+		debug(DEBUG_APPMSG1, "WARNING: The HEAD branch of CVS is called HEAD, not TRUNK");
 	    continue;
 	}
 
@@ -744,6 +754,7 @@ static int parse_args(int argc, char *argv[])
 	if (strcmp(argv[i], "-h") == 0)
 	    return usage(NULL, NULL);
 
+	/* see special handling of --norc in main */
 	if (strcmp(argv[i], "--norc") == 0)
 	{
 	    norc = "-f";
@@ -765,7 +776,14 @@ static int parse_args(int argc, char *argv[])
 	    if (++i >= argc)
 		return usage("argument to --diff-opts missing", "");
 
-	    diff_opts = argv[i++];
+	    /* allow diff_opts to be turned off by making empty string
+	     * into NULL
+	     */
+	    if (!strlen(argv[i]))
+		diff_opts = NULL;
+	    else
+		diff_opts = argv[i];
+	    i++;
 	    continue;
 	}
 
@@ -790,6 +808,13 @@ static int parse_args(int argc, char *argv[])
 	    continue;
 	}
 
+	if (strcmp(argv[i], "--no-cvs-direct") == 0)
+	{
+	    cvs_direct = 0;
+	    i++;
+	    continue;
+	}
+
 	if (strcmp(argv[i], "--debuglvl") == 0)
 	{
 	    if (++i >= argc)
@@ -806,10 +831,13 @@ static int parse_args(int argc, char *argv[])
 
 	    compress = atoi(argv[i++]);
 
-	    if (compress < 1 || compress > 9)
-		return usage("-Z level must be between 1 and 9 inclusive", argv[i-1]);
+	    if (compress < 0 || compress > 9)
+		return usage("-Z level must be between 1 and 9 inclusive (0 disables compression)", argv[i-1]);
 
-	    snprintf(compress_arg, 8, "-z%d", compress);
+	    if (compress == 0)
+		compress_arg[0] = 0;
+	    else
+		snprintf(compress_arg, 8, "-z%d", compress);
 	    continue;
 	}
 	
@@ -819,6 +847,13 @@ static int parse_args(int argc, char *argv[])
 		return usage("argument to --root missing", "");
 
 	    strcpy(root_path, argv[i++]);
+	    continue;
+	}
+
+	if (strcmp(argv[i], "-q") == 0)
+	{
+	    debuglvl &= ~DEBUG_APPMSG1;
+	    i++;
 	    continue;
 	}
 
@@ -1012,7 +1047,7 @@ static CvsFile * parse_file(const char * buff)
 	 *
 	 * For now just ignore such files
 	 */
-	debug(DEBUG_APPERROR, "*** file %s doesn't match strip_path %s. ignoring", 
+	debug(DEBUG_APPMSG1, "WARNING: file %s doesn't match strip_path %s. ignoring", 
 	      fn, strip_path);
 	return NULL;
     }
@@ -1094,6 +1129,14 @@ PatchSet * get_patch_set(const char * dte, const char * log, const char * author
 	    free(retval->descr);
 	}
 
+	if (retval->date < (*find)->min_date)
+	{
+	    (*find)->min_date = retval->date;
+	    debug(DEBUG_APPMSG1, "WARNING: non-increasing dates in encountered patchset members");
+	}
+	else if (retval->date > (*find)->max_date)
+	    (*find)->max_date = retval->date;
+
 	free(retval);
 	retval = *find;
     }
@@ -1101,6 +1144,9 @@ PatchSet * get_patch_set(const char * dte, const char * log, const char * author
     {
 	debug(DEBUG_STATUS, "new patch set!");
 	debug(DEBUG_STATUS, "%s %s %s", retval->author, retval->descr, dte);
+
+	retval->min_date = retval->max_date = retval->date;
+
 	if (tsearch(retval, &ps_tree_bytime, cmp2) == retval)
 		abort();
     }
@@ -1438,12 +1484,11 @@ static int compare_patch_sets(const void * v_ps1, const void * v_ps2)
     const PatchSet * ps2 = (const PatchSet *)v_ps2;
     long diff;
     int ret;
+    time_t d, min, max;
 
     /* We order by (author, descr, date), but because of the fuzz factor
      * we treat times within a certain distance as equal IFF the author
-     * and descr match.  If we allow the fuzz, but then the author or
-     * descr don't match, return the date diff (if any) in order to get
-     * the ordering right.
+     * and descr match.  
      */
 
     ret = strcmp(ps1->author, ps2->author);
@@ -1458,10 +1503,37 @@ static int compare_patch_sets(const void * v_ps1, const void * v_ps2)
     if (ret)
 	return ret;
 
+    /* 
+     * one of ps1 or ps2 is new.  the other should have the min_date
+     * and max_date set
+     */
+    if (ps1->min_date == 0)
+    {
+	d = ps1->date;
+	min = ps2->min_date;
+	max = ps2->max_date;
+    } 
+    else if (ps2->min_date == 0)
+    {
+	d = ps2->date;
+	min = ps1->min_date;
+	max = ps1->max_date;
+    }
+    else
+    {
+	debug(DEBUG_APPERROR, "how can we have both patchsets pre-existing?");
+	exit(1);
+    }
+
+    if ((min <= d && d <= max) || labs(min - d) <= timestamp_fuzz_factor || labs(d - max) <= timestamp_fuzz_factor)
+	return 0;
+
     diff = ps1->date - ps2->date;
 
     if (labs(diff) > timestamp_fuzz_factor)
 	return (diff < 0) ? -1 : 1;
+
+    debug(DEBUG_APPERROR, "don't expect to have fuzz matter here");
     return 0;
 }
 
@@ -1598,10 +1670,14 @@ static void do_cvs_diff(PatchSet * ps)
     {
 	PatchSetMember * psm = list_entry(next, PatchSetMember, link);
 	char cmdbuff[PATH_MAX * 2+1];
+	char esc_file[PATH_MAX];
 	int ret, check_ret = 0;
 
 	cmdbuff[0] = 0;
 	cmdbuff[PATH_MAX*2] = 0;
+
+	/* the filename may contain characters that the shell will barf on */
+	escape_filename(esc_file, PATH_MAX, psm->file->filename);
 
 	/*
 	 * Check the patchset funk. we may not want to diff this particular file 
@@ -1655,7 +1731,7 @@ static void do_cvs_diff(PatchSet * ps)
 	    else
 	    {
 		snprintf(cmdbuff, PATH_MAX * 2, "cvs %s %s %s -p -r %s %s%s | diff %s %s /dev/null %s | sed -e '%s s|^\\([+-][+-][+-]\\) -|\\1 %s%s|g'",
-			 compress_arg, norc, utype, rev, use_rep_path, psm->file->filename, dopts,
+			 compress_arg, norc, utype, rev, use_rep_path, esc_file, dopts,
 			 cr?"":"-",cr?"-":"", cr?"2":"1",
 			 use_rep_path, psm->file->filename);
 	    }
@@ -1675,7 +1751,7 @@ static void do_cvs_diff(PatchSet * ps)
 
 		snprintf(cmdbuff, PATH_MAX * 2, "cvs %s %s %s %s -r %s -r %s %s%s",
 			 compress_arg, norc, dtype, dopts, psm->pre_rev->rev, psm->post_rev->rev, 
-			 use_rep_path, psm->file->filename);
+			 use_rep_path, esc_file);
 	    }
 	}
 
@@ -1774,7 +1850,7 @@ CvsFileRevision * cvs_file_add_revision(CvsFile * file, const char * rev_str)
 	{
 	    if (get_branch(branch_str, branch_str))
 	    {
-		//debug(DEBUG_APPERROR, "warning: revision %s of file %s on unnamed branch", rev->rev, rev->file->filename);
+		debug(DEBUG_APPMSG1, "WARNING: revision %s of file %s on unnamed branch", rev->rev, rev->file->filename);
 		rev->branch = "#CVSPS_NO_BRANCH";
 	    }
 	    else
@@ -1822,6 +1898,9 @@ static PatchSet * create_patch_set()
     {
 	INIT_LIST_HEAD(&ps->members);
 	ps->psid = -1;
+	ps->date = 0;
+	ps->min_date = 0;
+	ps->max_date = 0;
 	ps->descr = NULL;
 	ps->author = NULL;
 	ps->tag = NULL;
@@ -2159,7 +2238,7 @@ static void set_psm_initial(PatchSetMember * psm)
 	 * but there can only be one such member in a given patchset
 	 */
 	if (psm->ps->branch_add)
-	    debug(DEBUG_APPERROR, "branch_add already set!");
+	    debug(DEBUG_APPMSG1, "WARNING: branch_add already set!");
 	psm->ps->branch_add = 1;
     }
 }
@@ -2221,8 +2300,8 @@ static int check_rev_funk(PatchSet * ps, CvsFileRevision * rev)
 		    next_ps->funk_factor = 
 			(next_ps->funk_factor == FNK_SHOW_ALL) ? FNK_SHOW_SOME : FNK_HIDE_SOME;
 		}
-		debug(DEBUG_APPERROR, 
-		      "Invalid PatchSet %d, Tag %s:\n"
+		debug(DEBUG_APPMSG1, 
+		      "WARNING: Invalid PatchSet %d, Tag %s:\n"
 		      "    %s:%s=after, %s:%s=before. Treated as 'before'", 
 		      next_ps->psid, ps->tag, 
 		      rev->file->filename, rev->rev, 
@@ -2273,4 +2352,18 @@ static CvsFileRevision * rev_follow_branch(CvsFileRevision * rev, const char * b
     }
     
     return NULL;
+}
+
+static void check_norc(int argc, char * argv[])
+{
+    int i = 1; 
+    while (i < argc)
+    {
+	if (strcmp(argv[i], "--norc") == 0)
+	{
+	    norc = "-f";
+	    break;
+	}
+	i++;
+    }
 }

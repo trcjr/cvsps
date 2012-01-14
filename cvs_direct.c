@@ -45,6 +45,7 @@ static void get_cvspass(char *, const char *);
 static void send_string(CvsServerCtx *, const char *, ...);
 static int read_response(CvsServerCtx *, const char *);
 static void ctx_to_fp(CvsServerCtx * ctx, FILE * fp);
+static int read_line(CvsServerCtx * ctx, char * p);
 
 static CvsServerCtx * open_ctx_pserver(CvsServerCtx *, const char *);
 static CvsServerCtx * open_ctx_forked(CvsServerCtx *, const char *);
@@ -120,6 +121,8 @@ CvsServerCtx * open_cvs_server(char * p_root, int compress)
 
     if (ctx)
     {
+	char buff[BUFSIZ];
+
 	send_string(ctx, "Root %s\n", ctx->root);
 
 	/* this is taken from 1.11.1p1 trace - but with Mbinary removed. we can't handle it (yet!) */
@@ -127,10 +130,34 @@ CvsServerCtx * open_cvs_server(char * p_root, int compress)
 
 	send_string(ctx, "valid-requests\n");
 
-	/* FIXME: look at this and determine if it's good */
-	/* instead, discard the response */
-	ctx_to_fp(ctx, NULL);
+	/* check for the commands we will issue */
+	read_line(ctx, buff);
+	if (strncmp(buff, "Valid-requests", 14) != 0)
+	{
+	    debug(DEBUG_APPERROR, "cvs_direct: bad response to valid-requests command");
+	    close_cvs_server(ctx);
+	    return NULL;
+	}
+
+	if (!strstr(buff, " version") ||
+	    !strstr(buff, " rlog") ||
+	    !strstr(buff, " rdiff") || 
+	    !strstr(buff, " diff") ||
+	    !strstr(buff, " co"))
+	{
+	    debug(DEBUG_APPERROR, "cvs_direct: cvs server too old for cvs_direct");
+	    close_cvs_server(ctx);
+	    return NULL;
+	}
 	
+	read_line(ctx, buff);
+	if (strcmp(buff, "ok") != 0)
+	{
+	    debug(DEBUG_APPERROR, "cvs_direct: bad ok trailer to valid-requests command");
+	    close_cvs_server(ctx);
+	    return NULL;
+	}
+
 	/* this is myterious but 'mandatory' */
 	send_string(ctx, "UseUnchanged\n");
 
@@ -678,10 +705,14 @@ static void ctx_to_fp(CvsServerCtx * ctx, FILE * fp)
     {
 	read_line(ctx, line);
 	debug(DEBUG_TCP, "ctx_to_fp: %s", line);
-	if (line[0] == 'M')
+	if (memcmp(line, "M ", 2) == 0)
 	{
 	    if (fp)
 		fprintf(fp, "%s\n", line + 2);
+	}
+	else if (memcmp(line, "E ", 2) == 0)
+	{
+	    debug(DEBUG_APPMSG1, "%s", line + 2);
 	}
 	else if (strncmp(line, "ok", 2) == 0 || strncmp(line, "error", 5) == 0)
 	{
@@ -856,6 +887,10 @@ char * cvs_rlog_fgets(char * buff, int buflen, CvsServerCtx * ctx)
 	memcpy(buff, lbuff + 2, len - 2);
 	buff[len - 2 ] = '\n';
 	buff[len - 1 ] = 0;
+    }
+    else if (memcmp(lbuff, "E ", 2) == 0)
+    {
+	debug(DEBUG_APPMSG1, "%s", lbuff + 2);
     }
     else if (strcmp(lbuff, "ok") == 0 ||strcmp(lbuff, "error") == 0)
     {

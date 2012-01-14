@@ -215,3 +215,29 @@ int my_system (const char *command)
 	    return status;
     } while(1);
 }
+
+int escape_filename(char * dst, int len, const char * src)
+{
+    static char * naughty_chars = " \\\"'@<>=;|&()#$`?*[!:{";
+
+    if (len > 0)
+    {
+	while (len > 1 && *src)
+	{
+	    if (strchr(naughty_chars, *src))
+	    {
+		if (len == 2)
+		    break;
+		*dst++ = '\\';
+		len--;
+	    }
+	    
+	    *dst++ = *src++;
+	    len--;
+	}
+
+	*dst = 0;
+    }
+
+    return (*src == 0) ? 0 : -1;
+}
