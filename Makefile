@@ -1,5 +1,5 @@
 MAJOR=2
-MINOR=0b6
+MINOR=0b7
 CC?=gcc
 CFLAGS?=-g -O2 -Wall 
 CFLAGS+=-I. -DVERSION=\"$(MAJOR).$(MINOR)\"
@@ -20,7 +20,7 @@ OBJS=\
 all: cvsps
 
 cvsps: $(OBJS)
-	$(CC) -o cvsps $(OBJS)
+	$(CC) -o cvsps $(OBJS) -lz
 
 install:
 	[ -d $(prefix)/bin ] || mkdir -p $(prefix)/bin

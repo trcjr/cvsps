@@ -8,11 +8,14 @@
 #include <stdlib.h>
 #include <limits.h>
 #include <stdarg.h>
+#include <zlib.h>
 #include <cbtcommon/debug.h>
 #include <cbtcommon/text_util.h>
 #include <cbtcommon/tcpsocket.h>
 #include <cbtcommon/sio.h>
+
 #include "cvs_direct.h"
+#include "util.h"
 
 #define RD_BUFF_SIZE 4096
 
@@ -20,22 +23,30 @@ struct _CvsServerCtx
 {
     int read_fd;
     int write_fd;
-    char repository[PATH_MAX];
+    char root[PATH_MAX];
 
     /* buffered reads from descriptor */
     char read_buff[RD_BUFF_SIZE];
     char * head;
     char * tail;
+
+    int compressed;
+    z_stream zout;
+    z_stream zin;
+
+    /* when reading compressed data, the compressed data buffer */
+    char zread_buff[RD_BUFF_SIZE];
 };
 
 static void get_cvspass(char *, const char *);
 static void send_string(CvsServerCtx *, const char *, ...);
 static int read_response(CvsServerCtx *, const char *);
+static void ctx_to_fp(CvsServerCtx * ctx, FILE * fp);
 
 static CvsServerCtx * open_ctx_pserver(CvsServerCtx *, const char *);
 static CvsServerCtx * open_ctx_forked(CvsServerCtx *, const char *);
 
-CvsServerCtx * open_cvs_server(char * p_root)
+CvsServerCtx * open_cvs_server(char * p_root, int compress)
 {
     CvsServerCtx * ctx = (CvsServerCtx*)malloc(sizeof(*ctx));
     char root[PATH_MAX];
@@ -46,6 +57,33 @@ CvsServerCtx * open_cvs_server(char * p_root)
 
     ctx->head = ctx->tail = ctx->read_buff;
     ctx->read_fd = ctx->write_fd = -1;
+    ctx->compressed = 0;
+
+    if (compress)
+    {
+	memset(&ctx->zout, 0, sizeof(z_stream));
+	memset(&ctx->zin, 0, sizeof(z_stream));
+	
+	/* 
+	 * to 'prime' the reads, make it look like there was output
+	 * room available (i.e. we have processed all pending compressed 
+	 * data
+	 */
+	ctx->zin.avail_out = 1;
+	
+	if (deflateInit(&ctx->zout, compress) != Z_OK)
+	{
+	    free(ctx);
+	    return NULL;
+	}
+	
+	if (inflateInit(&ctx->zin) != Z_OK)
+	{
+	    deflateEnd(&ctx->zout);
+	    free(ctx);
+	    return NULL;
+	}
+    }
 
     strcpy(root, p_root);
 
@@ -59,7 +97,7 @@ CvsServerCtx * open_cvs_server(char * p_root)
 	{
 	    ctx = open_ctx_pserver(ctx, p);
 	}
-	else if (strstr(method, "local:ext:fork:server"))
+	else if (strstr("local:ext:fork:server", method))
 	{
 	    /* handle all of these via fork, even local */
 	    ctx = open_ctx_forked(ctx, p);
@@ -77,7 +115,27 @@ CvsServerCtx * open_cvs_server(char * p_root)
     }
 
     if (ctx)
-	send_string(ctx, "Root %s\n", ctx->repository);
+    {
+	send_string(ctx, "Root %s\n", ctx->root);
+
+	/* this is taken from 1.11.1p1 trace */
+	send_string(ctx, "Valid-responses ok error Valid-requests Checked-in New-entry Checksum Copy-file Updated Created Update-existing Merged Patched Rcs-diff Mode Mod-time Removed Remove-entry Set-static-directory Clear-static-directory Set-sticky Clear-sticky Template Set-checkin-prog Set-update-prog Notified Module-expansion Wrapper-rcsOption M Mbinary E F MT\n", ctx->root);
+
+	send_string(ctx, "valid-requests\n");
+
+	/* FIXME: look at this and determine if it's good */
+	/* instead, discard the response */
+	ctx_to_fp(ctx, NULL);
+	
+	/* this is myterious but 'mandatory' */
+	send_string(ctx, "UseUnchanged\n");
+
+	if (compress)
+	{
+	    send_string(ctx, "Gzip-stream %d\n", compress);
+	    ctx->compressed = 1;
+	}
+    }
 
     return ctx;
 }
@@ -139,7 +197,7 @@ static CvsServerCtx * open_ctx_pserver(CvsServerCtx * ctx, const char * p_root)
     if ((ctx->read_fd = tcp_create_socket(REUSE_ADDR)) < 0)
 	goto out_free_err;
 
-    ctx->write_fd = ctx->read_fd;
+    ctx->write_fd = dup(ctx->read_fd);
 
     if (tcp_connect(ctx->read_fd, server, atoi(port)) < 0)
 	goto out_close_err;
@@ -153,7 +211,7 @@ static CvsServerCtx * open_ctx_pserver(CvsServerCtx * ctx, const char * p_root)
     if (!read_response(ctx, "I LOVE YOU"))
 	goto out_close_err;
 
-    strcpy(ctx->repository, p);
+    strcpy(ctx->root, p);
 
     return ctx;
 
@@ -250,7 +308,7 @@ static CvsServerCtx * open_ctx_forked(CvsServerCtx * ctx, const char * p_root)
     ctx->read_fd = from_cvs[0];
     ctx->write_fd = to_cvs[1];
 
-    strcpy(ctx->repository, rep);
+    strcpy(ctx->root, rep);
 
     return ctx;
 
@@ -267,13 +325,68 @@ static CvsServerCtx * open_ctx_forked(CvsServerCtx * ctx, const char * p_root)
 
 void close_cvs_server(CvsServerCtx * ctx)
 {
+    if (ctx->compressed)
+    {
+	int ret, len;
+	char buff[BUFSIZ];
+	    
+	do
+	{
+	    ctx->zout.next_out = buff;
+	    ctx->zout.avail_out = BUFSIZ;
+	    ret = deflate(&ctx->zout, Z_FINISH);
+
+	    if ((ret == Z_OK || ret == Z_STREAM_END) && ctx->zout.avail_out != BUFSIZ)
+	    {
+		len = BUFSIZ - ctx->zout.avail_out;
+		if (writen(ctx->write_fd, buff, len) != len)
+		    debug(DEBUG_APPERROR, "cvs_direct: zout: error writing final state");
+		    
+		//hexdump(buff, len, "cvs_direct: zout: sending unsent data");
+	    }
+	} while (ret == Z_OK);
+
+	do
+	{
+	    if (ctx->zin.avail_in == 0)
+	    {
+		len = read(ctx->read_fd, ctx->zread_buff, RD_BUFF_SIZE);
+		if (len > 0)
+		{
+		    ctx->zin.next_in = ctx->zread_buff;
+		    ctx->zin.avail_in = len;
+		}
+		else 
+		{
+		    debug(DEBUG_APPERROR, "cvs_direct: zin: EOF or ERROR waiting for Z_STREAM_END");
+		}
+	    }
+
+	    ctx->zin.next_out = buff;
+	    ctx->zin.avail_out = BUFSIZ;
+
+	    ret = inflate(&ctx->zin, Z_SYNC_FLUSH);
+	    len = BUFSIZ - ctx->zin.avail_out;
+	    if ((ret == Z_OK || ret == Z_STREAM_END) && len > 0)
+		hexdump(buff, BUFSIZ - ctx->zin.avail_out, "cvs_direct: zin: unread data at close");
+	} while (ret == Z_OK);
+
+	if ((ret = deflateEnd(&ctx->zout)) != Z_OK)
+	    debug(DEBUG_APPERROR, "cvs_direct: zout: deflateEnd error: %s: %s", 
+		  (ret == Z_STREAM_ERROR) ? "Z_STREAM_ERROR":"Z_DATA_ERROR", ctx->zout.msg);
+
+	if ((ret = inflateEnd(&ctx->zin)) != Z_OK)
+	    debug(DEBUG_APPERROR, "cvs_direct: zin: inflateEnd error: %s: %s", 
+		  (ret == Z_STREAM_ERROR) ? "Z_STREAM_ERROR":"Z_DATA_ERROR", ctx->zin.msg);
+    }
+
     if (ctx->read_fd >= 0)
     {
 	debug(DEBUG_TCP, "cvs_direct: closing cvs server connection %d", ctx->read_fd);
 	close(ctx->read_fd);
     }
 
-    if (ctx->write_fd >= 0 && ctx->write_fd != ctx->read_fd)
+    if (ctx->write_fd >= 0)
     {
 	debug(DEBUG_TCP, "cvs_direct: closing cvs server connection %d", ctx->write_fd);
 	close(ctx->write_fd);
@@ -333,6 +446,7 @@ static void send_string(CvsServerCtx * ctx, const char * str, ...)
     int len;
     char buff[BUFSIZ];
     va_list ap;
+
     va_start(ap, str);
 
     len = vsnprintf(buff, BUFSIZ, str, ap);
@@ -342,10 +456,53 @@ static void send_string(CvsServerCtx * ctx, const char * str, ...)
 	exit(1);
     }
 
-    if (writen(ctx->write_fd, buff, len)  != len)
+    if (ctx->compressed)
     {
-	debug(DEBUG_SYSERROR, "cvs_direct: can't send command");
-	exit(1);
+	char zbuff[BUFSIZ];
+
+	if  (ctx->zout.avail_in != 0)
+	{
+	    debug(DEBUG_APPERROR, "cvs_direct: zout: last output command not flushed");
+	    exit(1);
+	}
+
+	ctx->zout.next_in = buff;
+	ctx->zout.avail_in = len;
+	ctx->zout.avail_out = 0;
+
+	while (ctx->zout.avail_in > 0 || ctx->zout.avail_out == 0)
+	{
+	    int ret;
+
+	    ctx->zout.next_out = zbuff;
+	    ctx->zout.avail_out = BUFSIZ;
+	    
+	    /* FIXME: for the arguments before a command, flushing is counterproductive */
+	    ret = deflate(&ctx->zout, Z_SYNC_FLUSH);
+	    
+	    if (ret == Z_OK)
+	    {
+		len = BUFSIZ - ctx->zout.avail_out;
+		
+		if (writen(ctx->write_fd, zbuff, len) != len)
+		{
+		    debug(DEBUG_SYSERROR, "cvs_direct: zout: can't write");
+		    exit(1);
+		}
+	    }
+	    else
+	    {
+		debug(DEBUG_APPERROR, "cvs_direct: zout: error %d %s", ret, ctx->zout.msg);
+	    }
+	}
+    }
+    else
+    {
+	if (writen(ctx->write_fd, buff, len)  != len)
+	{
+	    debug(DEBUG_SYSERROR, "cvs_direct: can't send command");
+	    exit(1);
+	}
     }
 
     debug(DEBUG_TCP, "string: '%s' sent", buff);
@@ -353,15 +510,59 @@ static void send_string(CvsServerCtx * ctx, const char * str, ...)
 
 static int refill_buffer(CvsServerCtx * ctx)
 {
-    int len = ctx->read_buff + RD_BUFF_SIZE - ctx->tail;
-    if (len == 0)
+    int len;
+
+    if (ctx->head != ctx->tail)
     {
-	ctx->head = ctx->read_buff;
-	len = RD_BUFF_SIZE;
+	debug(DEBUG_APPERROR, "cvs_direct: refill_buffer called on non-empty buffer");
+	exit(1);
     }
 
-    len = read(ctx->read_fd, ctx->head, len);
-    ctx->tail = (len <= 0) ? ctx->head : ctx->head + len;
+    ctx->head = ctx->read_buff;
+    len = RD_BUFF_SIZE;
+	
+    if (ctx->compressed)
+    {
+	int zlen, ret;
+
+	/* if there was leftover buffer room, it's time to slurp more data */
+	do 
+	{
+	    if (ctx->zin.avail_out > 0)
+	    {
+		if (ctx->zin.avail_in != 0)
+		{
+		    debug(DEBUG_APPERROR, "cvs_direct: zin: expect 0 avail_in");
+		    exit(1);
+		}
+		zlen = read(ctx->read_fd, ctx->zread_buff, RD_BUFF_SIZE);
+		ctx->zin.next_in = ctx->zread_buff;
+		ctx->zin.avail_in = zlen;
+	    }
+	    
+	    ctx->zin.next_out = ctx->head;
+	    ctx->zin.avail_out = len;
+	    
+	    /* FIXME: we don't always need Z_SYNC_FLUSH, do we? */
+	    ret = inflate(&ctx->zin, Z_SYNC_FLUSH);
+	}
+	while (ctx->zin.avail_out == len);
+
+	if (ret == Z_OK)
+	{
+	    ctx->tail = ctx->head + (len - ctx->zin.avail_out);
+	}
+	else
+	{
+	    debug(DEBUG_APPERROR, "cvs_direct: zin: error %d %s", ret, ctx->zin.msg);
+	    exit(1);
+	}
+    }
+    else
+    {
+	len = read(ctx->read_fd, ctx->head, len);
+	ctx->tail = (len <= 0) ? ctx->head : ctx->head + len;
+    }
 
     return len;
 }
@@ -410,9 +611,14 @@ static void ctx_to_fp(CvsServerCtx * ctx, FILE * fp)
     {
 	read_line(ctx, line);
 	if (line[0] == 'M')
-	    fprintf(fp, "%s\n", line + 2);
+	{
+	    if (fp)
+		fprintf(fp, "%s\n", line + 2);
+	}
 	else if (strncmp(line, "ok", 2) == 0 || strncmp(line, "error", 5) == 0)
+	{
 	    break;
+	}
     }
 
     fflush(fp);
@@ -420,8 +626,10 @@ static void ctx_to_fp(CvsServerCtx * ctx, FILE * fp)
 
 void cvs_rdiff(CvsServerCtx * ctx, 
 	       const char * rep, const char * file, 
-	       const char * rev1, const char * rev2, const char * opts)
+	       const char * rev1, const char * rev2)
 {
+    /* NOTE: opts are ignored for rdiff, '-u' is always used */
+
     send_string(ctx, "Argument -u\n");
     send_string(ctx, "Argument -r\n");
     send_string(ctx, "Argument %s\n", rev1);
@@ -458,4 +666,81 @@ void cvs_rupdate(CvsServerCtx * ctx, const char * rep, const char * file, const 
     ctx_to_fp(ctx, fp);
 
     pclose(fp);
+}
+
+static int parse_patch_arg(char * arg, char ** str)
+{
+    char *tok, *tok2 = "";
+    tok = strsep(str, " ");
+    if (!tok)
+	return 0;
+
+    if (!*tok == '-')
+    {
+	debug(DEBUG_APPERROR, "diff_opts parse error: no '-' starting argument: %s", *str);
+	return 0;
+    }
+    
+    /* if it's not 'long format' argument, we can process it efficiently */
+    if (tok[1] == '-')
+    {
+	debug(DEBUG_APPERROR, "diff_opts parse_error: long format args not supported");
+	return 0;
+    }
+
+    /* see if command wants two args and they're separated by ' ' */
+    if (tok[2] == 0 && strchr("BdDFgiorVxYz", tok[1]))
+    {
+	tok2 = strsep(str, " ");
+	if (!tok2)
+	{
+	    debug(DEBUG_APPERROR, "diff_opts parse_error: argument %s requires two arguments", tok);
+	    return 0;
+	}
+    }
+    
+    snprintf(arg, 32, "%s%s", tok, tok2);
+    return 1;
+}
+
+void cvs_diff(CvsServerCtx * ctx, 
+	       const char * rep, const char * file, 
+	       const char * rev1, const char * rev2, const char * opts)
+{
+    char argstr[BUFSIZ], *p = argstr;
+    char arg[32];
+    char file_buff[PATH_MAX], *basename;
+
+    strzncpy(argstr, opts, BUFSIZ);
+    while (parse_patch_arg(arg, &p))
+	send_string(ctx, "Argument %s\n", arg);
+
+    send_string(ctx, "Argument -r\n");
+    send_string(ctx, "Argument %s\n", rev1);
+    send_string(ctx, "Argument -r\n");
+    send_string(ctx, "Argument %s\n", rev2);
+
+    /* 
+     * we need to separate the 'basename' of file in order to 
+     * generate the Directory directive(s)
+     */
+    strzncpy(file_buff, file, PATH_MAX);
+    if ((basename = strrchr(file_buff, '/')))
+    {
+	*basename = 0;
+	send_string(ctx, "Directory %s/%s\n", rep, file_buff);
+	send_string(ctx, "%s/%s/%s\n", ctx->root, rep, file_buff);
+    }
+    else
+    {
+	send_string(ctx, "Directory %s\n", rep, file_buff);
+	send_string(ctx, "%s/%s\n", ctx->root, rep);
+    }
+
+    send_string(ctx, "Directory .\n");
+    send_string(ctx, "%s\n", ctx->root);
+    send_string(ctx, "Argument %s/%s\n", rep, file);
+    send_string(ctx, "diff\n");
+
+    ctx_to_fp(ctx, stdout);
 }

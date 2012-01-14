@@ -15,6 +15,7 @@
 #include <sys/types.h>
 #include <fcntl.h>
 #include <regex.h>
+#include <sys/wait.h> /* for WEXITSTATUS - see system(3) */
 
 #include <cbtcommon/hash.h>
 #include <cbtcommon/list.h>
@@ -30,7 +31,7 @@
 #include "cap.h"
 #include "cvs_direct.h"
 
-RCSID("$Id: cvsps.c,v 4.77 2003/03/20 15:21:41 david Exp $");
+RCSID("$Id: cvsps.c,v 4.84 2003/03/25 05:18:13 david Exp $");
 
 #define CVS_LOG_BOUNDARY "----------------------------\n"
 #define CVS_FILE_BOUNDARY "=============================================================================\n"
@@ -100,11 +101,14 @@ static int restrict_tag_ps_start;
 static int restrict_tag_ps_end;
 static const char * diff_opts;
 static int bkcvs;
-static int no_rcmds;
+static int no_rlog;
 static int cvs_direct;
 static CvsServerCtx * cvs_direct_ctx;
+static int compress;
+static char compress_arg[8];
 
-static void parse_args(int, char *[]);
+static int parse_args(int, char *[]);
+static int parse_rc();
 static void load_from_cvs();
 static void init_strip_path();
 static CvsFile * parse_file(const char *);
@@ -134,11 +138,26 @@ static int before_tag(CvsFileRevision * rev, const char * tag);
 
 int main(int argc, char *argv[])
 {
-    debuglvl = DEBUG_APPERROR|DEBUG_SYSERROR;
+    debuglvl = DEBUG_APPERROR|DEBUG_SYSERROR|DEBUG_APPMSG1;
 
     INIT_LIST_HEAD(&show_patch_set_ranges);
 
-    parse_args(argc, argv);
+    if (parse_args(argc, argv) < 0)
+	exit(1);
+
+    if (strlen(norc) == 0 && parse_rc() < 0)
+	exit(1);
+
+    if (diff_opts && !cvs_direct && do_diff)
+    {
+	debug(DEBUG_APPMSG1, "\nWARNING: diff options are not supported by 'cvs rdiff'");
+	debug(DEBUG_APPMSG1, "         which is usually used to create diffs.  'cvs diff'");
+	debug(DEBUG_APPMSG1, "         will be used instead, but the resulting patches ");
+	debug(DEBUG_APPMSG1, "         will need to be applied using the '-p0' option");
+	debug(DEBUG_APPMSG1, "         to patch(1) (in the working directory), ");
+	debug(DEBUG_APPMSG1, "         instead of '-p1'\n");
+    }
+
     file_hash = create_hash_table(1023);
     global_symbols = create_hash_table(111);
 
@@ -181,14 +200,13 @@ int main(int argc, char *argv[])
     if (statistics)
 	print_statistics(ps_tree);
 
-    if (cvs_direct)
-	cvs_direct_ctx = open_cvs_server(root_path);
+    if (cvs_direct && do_diff)
+	cvs_direct_ctx = open_cvs_server(root_path, compress);
 
     twalk(ps_tree_bytime, show_ps_tree_node);
 
     if (summary_first++)
 	twalk(ps_tree_bytime, show_ps_tree_node);
-
 
     if (cvs_direct_ctx)
 	close_cvs_server(cvs_direct_ctx);
@@ -213,7 +231,7 @@ static void load_from_cvs()
     char use_rep_buff[PATH_MAX];
     char * ltype;
 
-    if (!no_rcmds && cvs_check_cap(CAP_HAVE_RLOG))
+    if (!no_rlog && cvs_check_cap(CAP_HAVE_RLOG))
     {
 	ltype = "rlog";
 	snprintf(use_rep_buff, PATH_MAX, "%s", repository_path);
@@ -238,11 +256,11 @@ static void load_from_cvs()
 	 * which is necessary to fill in the pre_rev stuff for a 
 	 * PatchSetMember
 	 */
-	snprintf(cmd, BUFSIZ, "cvs %s %s -d '%s<;%s' %s", norc, ltype, date_str, date_str, use_rep_buff);
+	snprintf(cmd, BUFSIZ, "cvs %s %s %s -d '%s<;%s' %s", compress_arg, norc, ltype, date_str, date_str, use_rep_buff);
     }
     else
     {
-	snprintf(cmd, BUFSIZ, "cvs %s %s %s", norc, ltype, use_rep_buff);
+	snprintf(cmd, BUFSIZ, "cvs %s %s %s %s", compress_arg, norc, ltype, use_rep_buff);
     }
     
     debug(DEBUG_STATUS, "******* USING CMD %s", cmd);
@@ -472,7 +490,7 @@ static void load_from_cvs()
     }
 }
 
-static void usage(const char * str1, const char * str2)
+static int usage(const char * str1, const char * str2)
 {
     if (str1)
 	debug(DEBUG_APPERROR, "\nbad usage: %s %s\n", str1, str2);
@@ -482,8 +500,8 @@ static void usage(const char * str1, const char * str2)
     debug(DEBUG_APPERROR, "             [-b <branch>]  [-l <regex>] [-r <tag> [-r <tag>]] ");
     debug(DEBUG_APPERROR, "             [-p <directory>] [-v] [-t] [--norc] [--summary-first]");
     debug(DEBUG_APPERROR, "             [--test-log <captured cvs log file>] [--bkcvs]");
-    debug(DEBUG_APPERROR, "             [--no-rcmds] [--diff-opts <option string>] [--cvs-direct]");
-    debug(DEBUG_APPERROR, "             [--debuglvl <bitmask>]");
+    debug(DEBUG_APPERROR, "             [--no-rlog] [--diff-opts <option string>] [--cvs-direct]");
+    debug(DEBUG_APPERROR, "             [--debuglvl <bitmask>] [-Z <compression>]");
     debug(DEBUG_APPERROR, "");
     debug(DEBUG_APPERROR, "Where:");
     debug(DEBUG_APPERROR, "  -h display this informative message");
@@ -510,15 +528,16 @@ static void usage(const char * str1, const char * str2)
     debug(DEBUG_APPERROR, "  --test-log <captured cvs log> supply a captured cvs log for testing");
     debug(DEBUG_APPERROR, "  --diff-opts <option string> supply special set of options to diff");
     debug(DEBUG_APPERROR, "  --bkcvs special hack for parsing the BK -> CVS log format");
-    debug(DEBUG_APPERROR, "  --no-rcmds disable rlog and rdiff (they're faulty in some setups)");
+    debug(DEBUG_APPERROR, "  --no-rlog disable rlog (it's faulty in some setups)");
     debug(DEBUG_APPERROR, "  --cvs-direct enable built-in cvs client code");
     debug(DEBUG_APPERROR, "  --debuglvl <bitmask> enable various debug channels.");
+    debug(DEBUG_APPERROR, "  -Z <compression> A value 1-9 which specifies amount of compression");
     debug(DEBUG_APPERROR, "\ncvsps version %s\n", VERSION);
 
-    exit(1);
+    return -1;
 }
 
-static void parse_args(int argc, char *argv[])
+static int parse_args(int argc, char *argv[])
 {
     int i = 1;
     while (i < argc)
@@ -526,7 +545,7 @@ static void parse_args(int argc, char *argv[])
 	if (strcmp(argv[i], "-z") == 0)
 	{
 	    if (++i >= argc)
-		usage("argument to -z missing", "");
+		return usage("argument to -z missing", "");
 
 	    timestamp_fuzz_factor = atoi(argv[i++]);
 	    continue;
@@ -545,7 +564,7 @@ static void parse_args(int argc, char *argv[])
 	    char * min_str, * max_str;
 
 	    if (++i >= argc)
-		usage("argument to -s missing", "");
+		return usage("argument to -s missing", "");
 
 	    min_str = strtok(argv[i++], ",");
 	    do
@@ -575,7 +594,7 @@ static void parse_args(int argc, char *argv[])
 	if (strcmp(argv[i], "-a") == 0)
 	{
 	    if (++i >= argc)
-		usage("argument to -a missing", "");
+		return usage("argument to -a missing", "");
 
 	    restrict_author = argv[i++];
 	    continue;
@@ -586,13 +605,13 @@ static void parse_args(int argc, char *argv[])
 	    int err;
 
 	    if (++i >= argc)
-		usage("argument to -l missing", "");
+		return usage("argument to -l missing", "");
 
 	    if ((err = regcomp(&restrict_log, argv[i++], REG_EXTENDED|REG_NOSUB)) != 0)
 	    {
 		char errbuf[256];
 		regerror(err, &restrict_log, errbuf, 256);
-		usage("bad regex to -l", errbuf);
+		return usage("bad regex to -l", errbuf);
 	    }
 
 	    have_restrict_log = 1;
@@ -605,13 +624,13 @@ static void parse_args(int argc, char *argv[])
 	    int err;
 
 	    if (++i >= argc)
-		usage("argument to -f missing", "");
+		return usage("argument to -f missing", "");
 
 	    if ((err = regcomp(&restrict_file, argv[i++], REG_EXTENDED|REG_NOSUB)) != 0)
 	    {
 		char errbuf[256];
 		regerror(err, &restrict_file, errbuf, 256);
-		usage("bad regex to -f", errbuf);
+		return usage("bad regex to -f", errbuf);
 	    }
 
 	    have_restrict_file = 1;
@@ -624,7 +643,7 @@ static void parse_args(int argc, char *argv[])
 	    time_t *pt;
 
 	    if (++i >= argc)
-		usage("argument to -d missing", "");
+		return usage("argument to -d missing", "");
 
 	    pt = (restrict_date_start == 0) ? &restrict_date_start : &restrict_date_end;
 	    convert_date(pt, argv[i++]);
@@ -634,7 +653,7 @@ static void parse_args(int argc, char *argv[])
 	if (strcmp(argv[i], "-r") == 0)
 	{
 	    if (++i >= argc)
-		usage("argument to -r missing", "");
+		return usage("argument to -r missing", "");
 
 	    if (restrict_tag_start)
 		restrict_tag_end = argv[i];
@@ -663,7 +682,7 @@ static void parse_args(int argc, char *argv[])
 	if (strcmp(argv[i], "-b") == 0)
 	{
 	    if (++i >= argc)
-		usage("argument to -b missing", "");
+		return usage("argument to -b missing", "");
 
 	    restrict_branch = argv[i++];
 	    /* Warn if the user tries to use TRUNK. Should eventually
@@ -677,7 +696,7 @@ static void parse_args(int argc, char *argv[])
 	if (strcmp(argv[i], "-p") == 0)
 	{
 	    if (++i >= argc)
-		usage("argument to -p missing", "");
+		return usage("argument to -p missing", "");
 	    
 	    patch_set_dir = argv[i++];
 	    continue;
@@ -705,7 +724,7 @@ static void parse_args(int argc, char *argv[])
 	}
 
 	if (strcmp(argv[i], "-h") == 0)
-	    usage(NULL, NULL);
+	    return usage(NULL, NULL);
 
 	if (strcmp(argv[i], "--norc") == 0)
 	{
@@ -717,7 +736,7 @@ static void parse_args(int argc, char *argv[])
 	if (strcmp(argv[i], "--test-log") == 0)
 	{
 	    if (++i >= argc)
-		usage("argument to --test-log missing", "");
+		return usage("argument to --test-log missing", "");
 
 	    test_log_file = argv[i++];
 	    continue;
@@ -726,7 +745,7 @@ static void parse_args(int argc, char *argv[])
 	if (strcmp(argv[i], "--diff-opts") == 0)
 	{
 	    if (++i >= argc)
-		usage("argument to --diff-opts missing", "");
+		return usage("argument to --diff-opts missing", "");
 
 	    diff_opts = argv[i++];
 	    continue;
@@ -739,9 +758,9 @@ static void parse_args(int argc, char *argv[])
 	    continue;
 	}
 
-	if (strcmp(argv[i], "--no-rcmds") == 0)
+	if (strcmp(argv[i], "--no-rlog") == 0)
 	{
-	    no_rcmds = 1;
+	    no_rlog = 1;
 	    i++;
 	    continue;
 	}
@@ -756,14 +775,66 @@ static void parse_args(int argc, char *argv[])
 	if (strcmp(argv[i], "--debuglvl") == 0)
 	{
 	    if (++i >= argc)
-		usage("argument to --debuglvl missing", "");
+		return usage("argument to --debuglvl missing", "");
 
 	    debuglvl = atoi(argv[i++]);
 	    continue;
 	}
 
-	usage("invalid argument", argv[i]);
+	if (strcmp(argv[i], "-Z") == 0)
+	{
+	    if (++i >= argc)
+		return usage("argument to -Z", "");
+
+	    compress = atoi(argv[i++]);
+
+	    if (compress < 1 || compress > 9)
+		return usage("-Z level must be between 1 and 9 inclusive", argv[i-1]);
+
+	    snprintf(compress_arg, 8, "-z%d", compress);
+	    continue;
+	}
+
+	return usage("invalid argument", argv[i]);
     }
+
+    return 0;
+}
+
+static int parse_rc()
+{
+    char rcfile[PATH_MAX];
+    FILE * fp;
+    snprintf(rcfile, PATH_MAX, "%s/cvspsrc", get_cvsps_dir());
+    if ((fp = fopen(rcfile, "r")))
+    {
+	char buff[BUFSIZ];
+	while (fgets(buff, BUFSIZ, fp))
+	{
+	    char * argv[3], *p;
+	    int argc = 2;
+
+	    chop(buff);
+
+	    argv[0] = "garbage";
+
+	    p = strchr(buff, ' ');
+	    if (p)
+	    {
+		*p++ = '\0';
+		argv[2] = xstrdup(p);
+		argc = 3;
+	    }
+
+	    argv[1] = xstrdup(buff);
+
+	    if (parse_args(argc, argv) < 0)
+		return -1;
+	}
+	fclose(fp);
+    }
+
+    return 0;
 }
 
 static void init_strip_path()
@@ -1431,22 +1502,30 @@ static void do_cvs_diff(PatchSet * ps)
     const char * dopts;
     const char * utype;
     char use_rep_path[PATH_MAX];
-    int rcmd = 0;
 
     fflush(stdout);
     fflush(stderr);
 
-    if (!no_rcmds && diff_opts == NULL) 
+    /* 
+     * if cvs_direct is not in effect, and diff options are specified,
+     * then we have to use diff instead of rdiff and we'll get a -p0 
+     * diff (instead of -p1) [in a manner of speaking].  So to make sure
+     * that the add/remove diffs get generated likewise, we need to use
+     * 'update' instead of 'co' 
+     *
+     * cvs_direct will always use diff (not rdiff), but will also always
+     * generate -p1 diffs.
+     */
+    if (diff_opts == NULL) 
     {
 	dopts = "-u";
 	dtype = "rdiff";
 	utype = "co";
-	rcmd = 1;
 	sprintf(use_rep_path, "%s/", repository_path);
     }
     else
     {
-	dopts = diff_opts ? diff_opts : "-u";
+	dopts = diff_opts;
 	dtype = "diff";
 	utype = "update";
 	use_rep_path[0] = 0;
@@ -1456,6 +1535,9 @@ static void do_cvs_diff(PatchSet * ps)
     {
 	PatchSetMember * psm = list_entry(next, PatchSetMember, link);
 	char cmdbuff[PATH_MAX * 2+1];
+	int ret, check_ret = 0;
+
+	cmdbuff[0] = 0;
 	cmdbuff[PATH_MAX*2] = 0;
 
 	/*
@@ -1482,61 +1564,77 @@ static void do_cvs_diff(PatchSet * ps)
 	 * The problem is that this must be piped to diff, and so the resulting
 	 * diff doesn't contain the filename anywhere! (diff between - and /dev/null).
 	 * sed is used to replace the '-' with the filename. 
+	 *
+	 * It's possible for pre_rev to be a 'dead' revision. This happens when a file 
+	 * is added on a branch. post_rev will be dead dead for remove
 	 */
+	if (!psm->pre_rev || psm->pre_rev->dead || psm->post_rev->dead)
+	{
+	    int cr;
+	    const char * rev;
 
-	/*
-	 * It's possible for pre_rev to be a 'dead' revision.
-	 * this happens when a file is added on a branch.
-	 */
-	if (!psm->pre_rev || psm->pre_rev->dead)
-	{
-	    if (cvs_direct && rcmd)
+	    if (!psm->pre_rev || psm->pre_rev->dead)
 	    {
-		strcpy(cmdbuff, "true");
-		cvs_rupdate(cvs_direct_ctx, use_rep_path, psm->file->filename, psm->post_rev->rev, 1, dopts);
+		cr = 1;
+		rev = psm->post_rev->rev;
 	    }
 	    else
 	    {
-		/* a 'create file' diff */
-		snprintf(cmdbuff, PATH_MAX * 2, "cvs %s %s -p -r %s %s%s | diff %s /dev/null - | sed -e '2 s|^+++ -|+++ %s%s|g'",
-			 norc, utype, psm->post_rev->rev, use_rep_path, psm->file->filename, dopts, 
-			 use_rep_path, psm->file->filename);
+		cr = 0;
+		rev = psm->pre_rev->rev;
 	    }
-	}
-	else if (psm->post_rev->dead)
-	{
-	    if (cvs_direct && rcmd)
+
+	    if (cvs_direct_ctx)
 	    {
-		strcpy(cmdbuff, "true");
-		cvs_rupdate(cvs_direct_ctx, use_rep_path, psm->file->filename, psm->pre_rev->rev, 0, dopts);
+		/* cvs_rupdate does the pipe through diff thing internally */
+		cvs_rupdate(cvs_direct_ctx, use_rep_path, psm->file->filename, rev, cr, dopts);
 	    }
 	    else
 	    {
-		/* a 'remove file' diff */
-		snprintf(cmdbuff, PATH_MAX * 2, "cvs %s %s -p -r %s %s%s | diff %s - /dev/null | sed -e '1 s|^--- -|--- %s%s|g'",
-			 norc, utype, psm->pre_rev->rev, use_rep_path, psm->file->filename, dopts, 
+		snprintf(cmdbuff, PATH_MAX * 2, "cvs %s %s %s -p -r %s %s%s | diff %s %s /dev/null %s | sed -e 's|^+++ -|+++ %s%s|g'",
+			 compress_arg, norc, utype, rev, use_rep_path, psm->file->filename, dopts,
+			 cr?"":"-",cr?"-":"",
 			 use_rep_path, psm->file->filename);
 	    }
 	}
 	else
 	{
 	    /* a regular diff */
-	    if (cvs_direct && rcmd)
+	    if (cvs_direct_ctx)
 	    {
-		strcpy(cmdbuff, "true");
-		cvs_rdiff(cvs_direct_ctx, use_rep_path, psm->file->filename, psm->pre_rev->rev, psm->post_rev->rev, dopts);
+		cvs_diff(cvs_direct_ctx, repository_path, psm->file->filename, psm->pre_rev->rev, psm->post_rev->rev, dopts);
 	    }
 	    else
 	    {
-		snprintf(cmdbuff, PATH_MAX * 2, "cvs %s %s %s -r %s -r %s %s%s",
-			 norc, dtype, dopts, psm->pre_rev->rev, psm->post_rev->rev, use_rep_path, psm->file->filename);
+		/* 'cvs diff' exit status '1' is ok, just means files are different */
+		if (strcmp(dtype, "diff") == 0)
+		    check_ret = 1;
+
+		snprintf(cmdbuff, PATH_MAX * 2, "cvs %s %s %s %s -r %s -r %s %s%s",
+			 compress_arg, norc, dtype, dopts, psm->pre_rev->rev, psm->post_rev->rev, 
+			 use_rep_path, psm->file->filename);
 	    }
 	}
 
-	if (system(cmdbuff))
+	/*
+	 * my_system doesn't block signals the way system does.
+	 * if ctrl-c is pressed while in there, we probably exit
+	 * immediately and hope the shell has sent the signal
+	 * to all of the process group members
+	 */
+	if (cmdbuff[0] && (ret = my_system(cmdbuff)))
 	{
-	    debug(DEBUG_APPERROR, "system command returned non-zero exit status. aborting");
-	    exit(1);
+	    int stat = WEXITSTATUS(ret);
+	    
+	    /* 
+	     * cvs diff returns 1 in exit status for 'files are different'
+	     * so use a better method to check for failure
+	     */
+	    if (stat < 0 || stat > check_ret || WIFSIGNALED(ret))
+	    {
+		debug(DEBUG_APPERROR, "system command returned non-zero exit status: %d: aborting", stat);
+		exit(1);
+	    }
 	}
     }
 }
