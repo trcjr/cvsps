@@ -11,7 +11,7 @@
 #include "hash.h"
 #include "rcsid.h"
 
-RCSID("$Id: hash.c,v 1.5 2001/10/25 18:36:10 adam Exp $");
+RCSID("$Id: hash.c,v 1.6 2003/05/07 15:42:38 david Exp $");
 
 #define HASH_CONST 37
 

@@ -1,5 +1,5 @@
 MAJOR=2
-MINOR=0rc1
+MINOR=1
 CC?=gcc
 CFLAGS?=-g -O2 -Wall 
 CFLAGS+=-I. -DVERSION=\"$(MAJOR).$(MINOR)\"
@@ -15,7 +15,8 @@ OBJS=\
 	util.o\
 	stats.o\
 	cap.o\
-	cvs_direct.o
+	cvs_direct.o\
+	list_sort.o
 
 all: cvsps
 
@@ -24,9 +25,9 @@ cvsps: $(OBJS)
 
 install:
 	[ -d $(prefix)/bin ] || mkdir -p $(prefix)/bin
-	[ -d $(prefix)/man/man1 ] || mkdir -p $(prefix)/man/man1
+	[ -d $(prefix)/share/man/man1 ] || mkdir -p $(prefix)/share/man/man1
 	install cvsps $(prefix)/bin
-	install -m 644 cvsps.1 $(prefix)/man/man1
+	install -m 644 cvsps.1 $(prefix)/share/man/man1
 
 clean:
 	rm -f cvsps *.o cbtcommon/*.o core
