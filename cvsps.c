@@ -112,6 +112,7 @@ static int cvs_direct;
 static int compress;
 static char compress_arg[8];
 static int track_branch_ancestry;
+static int arg_strip_path_count;
 
 static void check_norc(int, char *[]);
 static int parse_args(int, char *[]);
@@ -565,7 +566,7 @@ static int usage(const char * str1, const char * str2)
     debug(DEBUG_APPERROR, "             [--test-log <captured cvs log file>] [--bkcvs]");
     debug(DEBUG_APPERROR, "             [--no-rlog] [--diff-opts <option string>] [--cvs-direct]");
     debug(DEBUG_APPERROR, "             [--debuglvl <bitmask>] [-Z <compression>] [--root <cvsroot>]");
-    debug(DEBUG_APPERROR, "             [-q] [-A] [<repository>]");
+    debug(DEBUG_APPERROR, "             [-q] [-A] [--strip-path-count <count>] [<repository>]");
     debug(DEBUG_APPERROR, "");
     debug(DEBUG_APPERROR, "Where:");
     debug(DEBUG_APPERROR, "  -h display this informative message");
@@ -599,6 +600,7 @@ static int usage(const char * str1, const char * str2)
     debug(DEBUG_APPERROR, "  --root <cvsroot> specify cvsroot.  overrides env. and working directory (cvs-direct only)");
     debug(DEBUG_APPERROR, "  -q be quiet about warnings");
     debug(DEBUG_APPERROR, "  -A track and report branch ancestry");
+    debug(DEBUG_APPERROR, "  --strip-path-count <count> number occurances of <repository> to strip from the path of files in <cvsroot>");
     debug(DEBUG_APPERROR, "  <repository> apply cvsps to repository.  overrides working directory");
     debug(DEBUG_APPERROR, "\ncvsps version %s\n", VERSION);
 
@@ -904,6 +906,16 @@ static int parse_args(int argc, char *argv[])
 	    continue;
 	}
 
+	if (strcmp(argv[i], "--strip-path-count") == 0)
+	{
+	    if (++i >= argc)
+		return usage("argument to --strip-path-count missing", "");
+
+	    arg_strip_path_count = atoi(argv[i++]);
+        i++;
+	    continue;
+	}
+
 	if (argv[i][0] == '-')
 	    return usage("invalid argument", argv[i]);
 	
@@ -1066,21 +1078,25 @@ static CvsFile * parse_file(const char * buff)
 
     /* once a single file has been parsed ok we set this */
     static int path_ok;
-    
+
     /* chop the ",v" string and the "LF" */
     len -= 3;
     memcpy(fn, buff + 10, len);
     fn[len] = 0;
-    
+
     if (strncmp(fn, strip_path, strip_path_len) != 0)
     {
 	/* if the very first file fails the strip path,
 	 * then maybe we need to try for an alternate.
 	 * this will happen if symlinks are being used
-	 * on the server.  our best guess is to look
-	 * for the final occurance of the repository
-	 * path in the filename and use that.  it should work
-	 * except in the case where:
+	 * on the server.
+	 *
+	 * We have two options
+	 * 1) (default) Look for the final occurance of
+	 * 	the repository path.
+	 * 2) Look for the first occurance of the of the
+	 * 	repository path.
+	 * it should work except in the case where:
 	 * 1) the project has no files in the top-level directory
 	 * 2) the project has a directory with the same name as the project
 	 * 3) that directory sorts alphabetically before any other directory
@@ -1088,11 +1104,20 @@ static CvsFile * parse_file(const char * buff)
 	 */
 	if (!path_ok)
 	{
-	    char * p = fn, *lastp = NULL;
+        char * p = fn, *lastp = NULL, *last_lastp = NULL;
+        int i = 0;
 
-	    while ((p = strstr(p, repository_path)))
-		lastp = p++;
-      
+        while ((p = strstr(p, repository_path)))
+        {
+            i++;
+            lastp = p++;
+            if (arg_strip_path_count && arg_strip_path_count == i)
+            {
+                break;
+            }
+        }
+
+
 	    if (lastp)
 	    {
 		int len = strlen(repository_path);
