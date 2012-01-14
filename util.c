@@ -12,6 +12,7 @@
 #include <search.h>
 #include <time.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 
 #include <cbtcommon/debug.h>
 
@@ -20,7 +21,6 @@
 typedef int (*compare_func)(const void *, const void *);
 
 static void * string_tree;
-
 char *readfile(char const *filename, char *buf, size_t size)
 {
     FILE *fp;
@@ -158,4 +158,23 @@ void convert_date(time_t * t, const char * dte)
     {
 	*t = atoi(dte);
     }
+}
+
+static struct timeval start_time;
+
+void timing_start()
+{
+    gettimeofday(&start_time, NULL);
+}
+
+void timing_stop(const char * msg)
+{
+    struct timeval stop_time;
+    gettimeofday(&stop_time, NULL);
+    stop_time.tv_sec -= start_time.tv_sec;
+    stop_time.tv_usec -= start_time.tv_usec;
+    if (stop_time.tv_usec < 0)
+	stop_time.tv_sec--,stop_time.tv_usec += 1000000;
+
+    printf("Elapsed time for %s: %d.%06d\n", msg, (int)stop_time.tv_sec, (int)stop_time.tv_usec);
 }

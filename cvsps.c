@@ -26,8 +26,9 @@
 #include "cvsps_types.h"
 #include "cvsps.h"
 #include "util.h"
+#include "stats.h"
 
-RCSID("$Id: cvsps.c,v 4.54 2003/03/13 00:58:37 david Exp $");
+RCSID("$Id: cvsps.c,v 4.60 2003/03/17 15:21:48 david Exp $");
 
 #define CVS_LOG_BOUNDARY "----------------------------\n"
 #define CVS_FILE_BOUNDARY "=============================================================================\n"
@@ -53,6 +54,14 @@ const char * tag_flag_descr[] = {
     "**INVALID**"
 };
 
+const char * fnk_descr[] = {
+    "",
+    "FNK_SHOW_SOME",
+    "FNK_SHOW_ALL",
+    "FNK_HIDE_ALL",
+    "FNK_HIDE_SOME"
+};
+
 /* static globals */
 static int ps_counter;
 static void * ps_tree, * ps_tree_bytime;
@@ -68,6 +77,7 @@ static const char * test_log_file;
 
 /* settable via options */
 static int timestamp_fuzz_factor = 300;
+static int do_diff;
 static const char * restrict_author;
 static int have_restrict_log;
 static regex_t restrict_log;
@@ -92,6 +102,7 @@ static CvsFileRevision * parse_revision(CvsFile * file, char * rev_str);
 static void assign_pre_revision(PatchSetMember *, CvsFileRevision * rev);
 static void check_print_patch_set(PatchSet *);
 static void print_patch_set(PatchSet *);
+static void set_ps_id(const void *, const VISIT, const int);
 static void show_ps_tree_node(const void *, const VISIT, const int);
 static int compare_patch_sets(const void *, const void *);
 static int compare_patch_sets_bytime(const void *, const void *);
@@ -102,7 +113,6 @@ static void do_cvs_diff(PatchSet *);
 static PatchSet * create_patch_set();
 static PatchSetRange * create_patch_set_range();
 static void parse_sym(CvsFile *, char *);
-static void print_statistics(void);
 static void resolve_global_symbols();
 static int revision_affects_branch(CvsFileRevision *, const char *);
 static int is_vendor_branch(const char *);
@@ -144,22 +154,22 @@ int main(int argc, char *argv[])
 	do_write_cache = 1;
     }
 
+    ps_counter = 0;
+    twalk(ps_tree_bytime, set_ps_id);
+
+    timing_start();
     resolve_global_symbols();
+    timing_stop("resolve_global_symbols()");
 
     if (do_write_cache)
 	write_cache(cache_date, ps_tree_bytime);
 
     if (statistics)
-    {
-	printf("Statistics:\n");
-	print_statistics();
-    }
+	print_statistics(ps_tree);
 
-    ps_counter = 0;
     twalk(ps_tree_bytime, show_ps_tree_node);
     if (summary_first++)
     {
-	ps_counter = 0;
 	twalk(ps_tree_bytime, show_ps_tree_node);
     }
 
@@ -428,33 +438,34 @@ static void usage(const char * str1, const char * str2)
     if (str1)
 	debug(DEBUG_APPERROR, "\nbad usage: %s %s\n", str1, str2);
 
-    debug(DEBUG_APPERROR, "Usage: cvsps [-x] [-u] [-z <fuzz>] [-s <patchset>] [-a <author>] ");
+    debug(DEBUG_APPERROR, "Usage: cvsps [-x] [-u] [-z <fuzz>] [-g] [-s <patchset>] [-a <author>] ");
     debug(DEBUG_APPERROR, "             [-f <file>] [-d <date1> [-d <date2>]] [-b <branch>]");
-    debug(DEBUG_APPERROR, "             [-v] [-h] [-l <regex>] [-r <tag> [-r <tag>]]");
-    debug(DEBUG_APPERROR, "             [-p <directory>] [-t] [--no-rc] [--summary-first]");
+    debug(DEBUG_APPERROR, "             [-l <regex>] [-r <tag> [-r <tag>]] [-p <directory>]");
+    debug(DEBUG_APPERROR, "             [-v] [-h] [-t] [--norc] [--summary-first]");
     debug(DEBUG_APPERROR, "             [--test-log <captured cvs log file>]");
     debug(DEBUG_APPERROR, "");
     debug(DEBUG_APPERROR, "Where:");
     debug(DEBUG_APPERROR, "  -x ignore (and rebuild) cvsps.cache file");
     debug(DEBUG_APPERROR, "  -u update cvsps.cache file");
     debug(DEBUG_APPERROR, "  -z <fuzz> set the timestamp fuzz factor for identifying patch sets");
-    debug(DEBUG_APPERROR, "  -s <patchset> generate a diff for a given patchset");
-    debug(DEBUG_APPERROR, "  -a <author> restrict output to patchsets created by author");
-    debug(DEBUG_APPERROR, "  -l <regex> restrict output to patchsets matching <regex> in log message");
-    debug(DEBUG_APPERROR, "  -f <file> restrict output to patchsets involving file");
+    debug(DEBUG_APPERROR, "  -g generate diffs of the selected patch sets");
+    debug(DEBUG_APPERROR, "  -s <patch set>[-[<patch set>]][,<patch set>...] restrict patch sets by id");
+    debug(DEBUG_APPERROR, "  -a <author> restrict output to patch sets created by author");
+    debug(DEBUG_APPERROR, "  -f <file> restrict output to patch sets involving file");
     debug(DEBUG_APPERROR, "  -d <date1> -d <date2> if just one date specified, show");
     debug(DEBUG_APPERROR, "     revisions newer than date1.  If two dates specified,");
     debug(DEBUG_APPERROR, "     show revisions between two dates.");
+    debug(DEBUG_APPERROR, "  -b <branch> restrict output to patch sets affecting history of branch");
+    debug(DEBUG_APPERROR, "  -l <regex> restrict output to patch sets matching <regex> in log message");
     debug(DEBUG_APPERROR, "  -r <tag1> -r <tag2> if just one tag specified, show");
     debug(DEBUG_APPERROR, "     revisions since tag1. If two tags specified, show");
     debug(DEBUG_APPERROR, "     revisions between the two tags.");
-    debug(DEBUG_APPERROR, "  -b <branch> restrict output to patchsets affecting history of branch");
-    debug(DEBUG_APPERROR, "  -p <directory> output patchsets to individual files in <directory>");
+    debug(DEBUG_APPERROR, "  -p <directory> output patch sets to individual files in <directory>");
     debug(DEBUG_APPERROR, "  -v show verbose parsing messages");
     debug(DEBUG_APPERROR, "  -t show some brief memory usage statistics");
     debug(DEBUG_APPERROR, "  --norc when invoking cvs, ignore the .cvsrc file");
     debug(DEBUG_APPERROR, "  -h display this informative message");
-    debug(DEBUG_APPERROR, "  --summary-first when multiple patchsets are shown, put all summaries first");
+    debug(DEBUG_APPERROR, "  --summary-first when multiple patch sets are shown, put all summaries first");
     debug(DEBUG_APPERROR, "  --test-log <captured cvs log> supply a captured cvs log for testing");
     debug(DEBUG_APPERROR, "\ncvsps version %s\n", VERSION);
 
@@ -472,6 +483,13 @@ static void parse_args(int argc, char *argv[])
 		usage("argument to -z missing", "");
 
 	    timestamp_fuzz_factor = atoi(argv[i++]);
+	    continue;
+	}
+	
+	if (strcmp(argv[i], "-g") == 0)
+	{
+	    do_diff = 1;
+	    i++;
 	    continue;
 	}
 	
@@ -924,13 +942,8 @@ static void assign_pre_revision(PatchSetMember * psm, CvsFileRevision * rev)
 
 static void check_print_patch_set(PatchSet * ps)
 {
-    /*
-     * Ignore the 'BRANCH ADD' patchsets 
-     */
-    if (ps->branch_add)
+    if (ps->psid < 0)
 	return;
-
-    ps_counter++;
 
     if (restrict_date_start > 0 &&
 	(ps->date < restrict_date_start ||
@@ -950,23 +963,23 @@ static void check_print_patch_set(PatchSet * ps)
 	return;
     
     /* the funk_factor overrides the restrict_tag_start and end */
-    if (ps->funk_factor < 0)
-	return;
-
-    if (ps->funk_factor > 0)
+    if (ps->funk_factor == FNK_SHOW_SOME || ps->funk_factor == FNK_SHOW_ALL)
 	goto ok;
+
+    if (ps->funk_factor == FNK_HIDE_ALL)
+	return;
 
     /* resolve the ps.id of the start and end tag restrictions if necessary */
     if (restrict_tag_start && restrict_tag_ps_start == 0) 
     {
 	if (ps->tag && strcmp(ps->tag, restrict_tag_start) == 0)
-	    restrict_tag_ps_start = ps_counter;
+	    restrict_tag_ps_start = ps->psid;
     }
 
     if (restrict_tag_end && restrict_tag_ps_end == 0)
     {
 	if (ps->tag && strcmp(ps->tag, restrict_tag_end) == 0)
-	    restrict_tag_ps_end = ps_counter;
+	    restrict_tag_ps_end = ps->psid;
     }
 
     /* 
@@ -976,15 +989,15 @@ static void check_print_patch_set(PatchSet * ps)
      */
     if (restrict_tag_start)
     {
-	if (restrict_tag_ps_start == 0 || ps_counter <= restrict_tag_ps_start)
+	if (restrict_tag_ps_start == 0 || ps->psid <= restrict_tag_ps_start)
 	{
-	    if (ps_counter == restrict_tag_ps_start)
-		debug(DEBUG_STATUS, "PatchSet %d matches tag %s.", ps_counter, restrict_tag_start);
+	    if (ps->psid == restrict_tag_ps_start)
+		debug(DEBUG_STATUS, "PatchSet %d matches tag %s.", ps->psid, restrict_tag_start);
 
 	    return;
 	}
 
-	if (restrict_tag_end && restrict_tag_ps_end > 0 && ps_counter > restrict_tag_ps_end)
+	if (restrict_tag_end && restrict_tag_ps_end > 0 && ps->psid > restrict_tag_ps_end)
 	    return;
     }
 
@@ -996,8 +1009,8 @@ static void check_print_patch_set(PatchSet * ps)
 	while (next != &show_patch_set_ranges)
 	{
 	    PatchSetRange *range = list_entry(next, PatchSetRange, link);
-	    if (range->min_counter <= ps_counter &&
-		ps_counter <= range->max_counter)
+	    if (range->min_counter <= ps->psid &&
+		ps->psid <= range->max_counter)
 	    {
 		break;
 	    }
@@ -1012,7 +1025,7 @@ static void check_print_patch_set(PatchSet * ps)
     {
 	char path[PATH_MAX];
 
-	snprintf(path, PATH_MAX, "%s/%d.patch", patch_set_dir, ps_counter);
+	snprintf(path, PATH_MAX, "%s/%d.patch", patch_set_dir, ps->psid);
 
 	fflush(stdout);
 	close(1);
@@ -1022,7 +1035,7 @@ static void check_print_patch_set(PatchSet * ps)
 	    exit(1);
 	}
 
-	fprintf(stderr, "Directing PatchSet %d to file %s\n", ps_counter, path);
+	fprintf(stderr, "Directing PatchSet %d to file %s\n", ps->psid, path);
     }
 
     /*
@@ -1036,7 +1049,7 @@ static void check_print_patch_set(PatchSet * ps)
      */
     if (summary_first <= 1)
 	print_patch_set(ps);
-    if (!list_empty(&show_patch_set_ranges) && summary_first != 1)
+    if (do_diff && summary_first != 1)
 	do_cvs_diff(ps);
 
     fflush(stdout);
@@ -1046,13 +1059,16 @@ static void print_patch_set(PatchSet * ps)
 {
     struct tm * tm;
     struct list_head * next;
+    const char * funk = "";
 
     tm = localtime(&ps->date);
     next = ps->members.next;
     
+    funk = fnk_descr[ps->funk_factor];
+    
     /* this '---...' is different from the 28 hyphens that separate cvs log output */
     printf("---------------------\n");
-    printf("PatchSet %d %s\n", ps_counter, ps->funk_factor > 0 ? "(FUNKY)" :"");
+    printf("PatchSet %d %s\n", ps->psid, funk);
     printf("Date: %d/%02d/%02d %02d:%02d:%02d\n", 
 	   1900 + tm->tm_year, tm->tm_mon + 1, tm->tm_mday, 
 	   tm->tm_hour, tm->tm_min, tm->tm_sec);
@@ -1065,16 +1081,54 @@ static void print_patch_set(PatchSet * ps)
     while (next != &ps->members)
     {
 	PatchSetMember * psm = list_entry(next, PatchSetMember, link);
+	if (ps->funk_factor == FNK_SHOW_SOME && psm->bad_funk)
+	    funk = "(BEFORE START TAG)";
+	else if (ps->funk_factor == FNK_HIDE_SOME && !psm->bad_funk)
+	    funk = "(AFTER END TAG)";
+	else
+	    funk = "";
 
-	printf("\t%s:%s->%s%s\n", 
+	printf("\t%s:%s->%s%s %s\n", 
 	       psm->file->filename, 
 	       psm->pre_rev ? psm->pre_rev->rev : "INITIAL", 
 	       psm->post_rev->rev, 
-	       psm->post_rev->dead ? "(DEAD)": "");
+	       psm->post_rev->dead ? "(DEAD)": "",
+	       funk);
+
 	next = next->next;
     }
     
     printf("\n");
+}
+
+static void set_ps_id(const void * nodep, const VISIT which, const int depth)
+{
+    PatchSet * ps;
+
+    switch(which)
+    {
+    case postorder:
+    case leaf:
+	ps = *(PatchSet**)nodep;
+
+	/*
+	 * Ignore the 'BRANCH ADD' patchsets 
+	 */
+	if (!ps->branch_add)
+	{
+	    ps_counter++;
+	    ps->psid = ps_counter;
+	}
+	else
+	{
+	    ps->psid = -1;
+	}
+
+	break;
+
+    default:
+	break;
+    }
 }
 
 static void show_ps_tree_node(const void * nodep, const VISIT which, const int depth)
@@ -1214,16 +1268,34 @@ static int patch_set_affects_branch(PatchSet * ps, const char * branch)
 
 static void do_cvs_diff(PatchSet * ps)
 {
-    struct list_head * next = ps->members.next;
+    struct list_head * next;
 
     fflush(stdout);
     fflush(stderr);
 
-    while (next != &ps->members)
+    for (next = ps->members.next; next != &ps->members; next = next->next)
     {
 	PatchSetMember * psm = list_entry(next, PatchSetMember, link);
 	char cmdbuff[PATH_MAX * 2+1];
 	cmdbuff[PATH_MAX*2] = 0;
+
+	/*
+	 * Check the patchset funk. we may not want to diff this particular file 
+	 */
+	if (ps->funk_factor == FNK_SHOW_SOME && psm->bad_funk)
+	{
+	    printf("Index: %s\n", psm->file->filename);
+	    printf("===================================================================\n");
+	    printf("*** Member not diffed, before start tag\n");
+	    continue;
+	}
+	else if (ps->funk_factor == FNK_HIDE_SOME && !psm->bad_funk)
+	{
+	    printf("Index: %s\n", psm->file->filename);
+	    printf("===================================================================\n");
+	    printf("*** Member not diffed, after end tag\n");
+	    continue;
+	}
 
 	/*
 	 * It's possible for pre_rev to be a 'dead' revision.
@@ -1247,8 +1319,6 @@ static void do_cvs_diff(PatchSet * ps)
 	}
 
 	system(cmdbuff);
-
-	next = next->next;
     }
 }
 
@@ -1363,6 +1433,7 @@ static PatchSet * create_patch_set()
     if (ps)
     {
 	INIT_LIST_HEAD(&ps->members);
+	ps->psid = -1;
 	ps->descr = NULL;
 	ps->author = NULL;
 	ps->tag = NULL;
@@ -1379,7 +1450,9 @@ PatchSetMember * create_patch_set_member()
     PatchSetMember * psm = (PatchSetMember*)calloc(1, sizeof(*psm));
     psm->pre_rev = NULL;
     psm->post_rev = NULL;
+    psm->ps = NULL;
     psm->file = NULL;
+    psm->bad_funk = 0;
     return psm;
 }
 
@@ -1528,131 +1601,6 @@ char * cvs_file_add_branch(CvsFile * file, const char * rev, const char * tag)
     return new_tag;
 }
 
-static void count_hash(struct hash_table *hash, unsigned int *total, 
-	unsigned int *max_val)
-{
-    int counter = 0;
-    struct hash_entry *fh;
-    
-    reset_hash_iterator(hash);
-    while ((fh = next_hash_entry(hash)))
-	counter++;
-
-    *total += counter;
-    *max_val= MAX(*max_val, counter);
-}
-
-static unsigned int num_patch_sets = 0;
-static unsigned int num_ps_member = 0, max_ps_member_in_ps = 0;
-static unsigned int num_authors = 0, max_author_len = 0, total_author_len = 0;
-static unsigned int max_descr_len = 0, total_descr_len = 0;
-struct hash_table *author_hash;
-
-static void stat_ps_tree_node(const void * nodep, const VISIT which, const int depth)
-{
-    int desc_len;
-    PatchSet * ps;
-    struct list_head * next;
-    int counter;
-    void * old;
-
-    /* Make sure we have it if we do statistics */
-    if (!author_hash)
-	author_hash = create_hash_table(1023);
-
-    switch(which)
-    {
-    case postorder:
-    case leaf:
-	ps = *(PatchSet**)nodep;
-	num_patch_sets++;
-
-	/* Author statistics */
-	if (put_hash_object_ex(author_hash, ps->author, ps->author, HT_NO_KEYCOPY, NULL, &old) >= 0 && old)
-	{
-	    int len = strlen(ps->author);
-	    num_authors++;
-	    max_author_len = MAX(max_author_len, len);
-	    total_author_len += len;
-	}
-
-	/* Log message statistics */
-	desc_len = strlen(ps->descr);
-	max_descr_len = MAX(max_descr_len, desc_len);
-	total_descr_len += desc_len;
-	
-	/* PatchSet member statistics */
-	counter = 0;
-	next = ps->members.next;
-	while (next != &ps->members)
-	{
-	    counter++;
-	    next = next->next;
-	}
-
-	num_ps_member += counter;
-	max_ps_member_in_ps = MAX(max_ps_member_in_ps, counter);
-	break;
-
-    default:
-	break;
-    }
-}
-
-static void print_statistics(void)
-{
-    /* Statistics data */
-    unsigned int num_files = 0, max_file_len = 0, total_file_len = 0;
-    unsigned int total_revisions = 0, max_revisions_for_file = 0;
-    unsigned int total_branches = 0, max_branches_for_file = 0;
-    unsigned int total_branches_sym = 0, max_branches_sym_for_file = 0;
-
-    /* Other vars */
-    struct hash_entry *he;
-   
-    fflush(stdout);
-
-    /* Gather file statistics */
-    reset_hash_iterator(file_hash);
-    while ((he=next_hash_entry(file_hash)))
-    {
-	int len = strlen(he->he_key);
-	CvsFile *file = (CvsFile *)he->he_obj;
-	
-	num_files++;
-	max_file_len = MAX(max_file_len, len);
-	total_file_len += len;
-
-	count_hash(file->revisions, &total_revisions, &max_revisions_for_file);
-	count_hash(file->branches, &total_branches, &max_branches_for_file);
-	count_hash(file->branches_sym, &total_branches_sym,
-	    &max_branches_sym_for_file);
-    }
-
-    /* Print file statistics */
-    printf("Num files: %d\nMax filename len: %d, Average filename len: %.2f\n",
-	    num_files, max_file_len, (float)total_file_len/num_files);
-
-    printf("Max revisions for file: %d, Average revisions for file: %.2f\n",
-	  max_revisions_for_file, (float)total_revisions/num_files);
-    printf("Max branches for file: %d, Average branches for file: %.2f\n",
-	  max_branches_for_file, (float)total_branches/num_files);
-    printf("Max branches_sym for file: %d, Average branches_sym for file: %.2f\n",
-	  max_branches_sym_for_file, (float)total_branches_sym/num_files);
-
-    /* Gather patchset statistics */
-    twalk(ps_tree, stat_ps_tree_node);
-
-    /* Print patchset statistics */
-    printf("Num patchsets: %d\n", num_patch_sets);
-    printf("Max PS members in PS: %d\nAverage PS members in PS: %.2f\n",
-	    max_ps_member_in_ps, (float)num_ps_member/num_patch_sets);
-    printf("Num authors: %d, Max author len: %d, Avg. author len: %.2f\n", 
-	    num_authors, max_author_len, (float)total_author_len/num_authors);
-    printf("Max desc len: %d, Avg. desc len: %.2f\n",
-	    max_descr_len, (float)total_descr_len/num_patch_sets);
-}
-
 /*
  * Resolve each global symbol to a PatchSet.  This is
  * not necessarily doable, because tagging isn't 
@@ -1729,8 +1677,8 @@ static void resolve_global_symbols()
 	    if (next_rev->post_psm->ps->date < ps->date)
 	    {
 		int flag = check_rev_funk(ps, next_rev);
-		debug(DEBUG_APPERROR, "file %s revision %s tag %s: TAG VIOLATION",
-		      rev->file->filename, rev->rev, sym->tag);
+		debug(DEBUG_STATUS, "file %s revision %s tag %s: TAG VIOLATION %s",
+		      rev->file->filename, rev->rev, sym->tag, tag_flag_descr[flag]);
 		ps->tag_flags |= flag;
 	    }
 	}
@@ -1823,6 +1771,8 @@ static void set_psm_initial(PatchSetMember * psm)
  */
 static int check_rev_funk(PatchSet * ps, CvsFileRevision * rev)
 {
+    int retval = TAG_FUNKY;
+
     while (rev)
     {
 	PatchSet * next_ps = rev->post_psm->ps;
@@ -1834,13 +1784,6 @@ static int check_rev_funk(PatchSet * ps, CvsFileRevision * rev)
 	debug(DEBUG_STATUS, "ps->date %d next_ps->date %d rev->rev %s rev->branch %s", 
 	      ps->date, next_ps->date, rev->rev, rev->branch);
 
-	for (next = next_ps->members.next; next != &next_ps->members; next = next->next)
-	{
-	    PatchSetMember * psm = list_entry(next, PatchSetMember, link);
-	    if (before_tag(psm->post_rev, ps->tag))
-		return TAG_INVALID;
-	}
-
 	/*
 	 * If the ps->tag is one of the two possible '-r' tags
 	 * then the funkyness is even more important.
@@ -1850,16 +1793,48 @@ static int check_rev_funk(PatchSet * ps, CvsFileRevision * rev)
 	 * be included.
 	 *
 	 * The restrict_tag_end case is similar, but backwards.
+	 *
+	 * Start assuming the HIDE/SHOW_ALL case, we will determine
+	 * below if we have a split ps case 
 	 */
 	if (restrict_tag_start && strcmp(ps->tag, restrict_tag_start) == 0)
-	    next_ps->funk_factor = 1;
+	    next_ps->funk_factor = FNK_SHOW_ALL;
 	if (restrict_tag_end && strcmp(ps->tag, restrict_tag_end) == 0)
-	    next_ps->funk_factor = -1;
+	    next_ps->funk_factor = FNK_HIDE_ALL;
+
+	/*
+	 * if all of the other members of this patchset are also 'after' the tag
+	 * then this is a 'funky' patchset w.r.t. the tag.  however, if some are
+	 * before then the patchset is 'invalid' w.r.t. the tag, and we mark
+	 * the members individually with 'bad_funk' ,if this tag is the
+	 * '-r' tag.  Then we can actually split the diff on this patchset
+	 */
+	for (next = next_ps->members.next; next != &next_ps->members; next = next->next)
+	{
+	    PatchSetMember * psm = list_entry(next, PatchSetMember, link);
+	    if (before_tag(psm->post_rev, ps->tag))
+	    {
+		retval = TAG_INVALID;
+		/* only set bad_funk for one of the -r tags */
+		if (next_ps->funk_factor)
+		{
+		    psm->bad_funk = 1;
+		    next_ps->funk_factor = 
+			(next_ps->funk_factor == FNK_SHOW_ALL) ? FNK_SHOW_SOME : FNK_HIDE_SOME;
+		}
+		debug(DEBUG_APPERROR, 
+		      "Invalid PatchSet %d, Tag %s:\n"
+		      "    %s:%s=after, %s:%s=before. Treated as 'before'", 
+		      next_ps->psid, ps->tag, 
+		      rev->file->filename, rev->rev, 
+		      psm->post_rev->file->filename, psm->post_rev->rev);
+	    }
+	}
 
 	rev = rev_follow_branch(rev, ps->branch);
     }
 
-    return TAG_FUNKY;
+    return retval;
 }
 
 /* determine if the revision is before the tag */
