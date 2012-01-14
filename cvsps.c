@@ -28,8 +28,9 @@
 #include "util.h"
 #include "stats.h"
 #include "cap.h"
+#include "cvs_direct.h"
 
-RCSID("$Id: cvsps.c,v 4.70 2003/03/19 16:21:32 david Exp $");
+RCSID("$Id: cvsps.c,v 4.77 2003/03/20 15:21:41 david Exp $");
 
 #define CVS_LOG_BOUNDARY "----------------------------\n"
 #define CVS_FILE_BOUNDARY "=============================================================================\n"
@@ -68,6 +69,7 @@ static int ps_counter;
 static void * ps_tree, * ps_tree_bytime;
 static struct hash_table * global_symbols;
 static char strip_path[PATH_MAX];
+static char root_path[PATH_MAX];
 static char repository_path[PATH_MAX];
 static int strip_path_len;
 static time_t cache_date;
@@ -83,7 +85,8 @@ static int do_diff;
 static const char * restrict_author;
 static int have_restrict_log;
 static regex_t restrict_log;
-static const char * restrict_file;
+static int have_restrict_file;
+static regex_t restrict_file;
 static time_t restrict_date_start;
 static time_t restrict_date_end;
 static const char * restrict_branch;
@@ -98,6 +101,8 @@ static int restrict_tag_ps_end;
 static const char * diff_opts;
 static int bkcvs;
 static int no_rcmds;
+static int cvs_direct;
+static CvsServerCtx * cvs_direct_ctx;
 
 static void parse_args(int, char *[]);
 static void load_from_cvs();
@@ -113,7 +118,7 @@ static int compare_patch_sets_bk(const void *, const void *);
 static int compare_patch_sets(const void *, const void *);
 static int compare_patch_sets_bytime(const void *, const void *);
 static int is_revision_metadata(const char *);
-static int patch_set_contains_member(PatchSet *, const char *);
+static int patch_set_member_regex(PatchSet * ps, regex_t * reg);
 static int patch_set_affects_branch(PatchSet *, const char *);
 static void do_cvs_diff(PatchSet *);
 static PatchSet * create_patch_set();
@@ -176,10 +181,17 @@ int main(int argc, char *argv[])
     if (statistics)
 	print_statistics(ps_tree);
 
+    if (cvs_direct)
+	cvs_direct_ctx = open_cvs_server(root_path);
+
     twalk(ps_tree_bytime, show_ps_tree_node);
 
     if (summary_first++)
 	twalk(ps_tree_bytime, show_ps_tree_node);
+
+
+    if (cvs_direct_ctx)
+	close_cvs_server(cvs_direct_ctx);
 
     exit(0);
 }
@@ -447,9 +459,17 @@ static void load_from_cvs()
     }
     
     if (test_log_file)
+    {
 	fclose(cvsfp);
+    }
     else 
-	pclose(cvsfp);
+    {
+	if (pclose(cvsfp) < 0)
+	{
+	    debug(DEBUG_APPERROR, "cvs rlog command exited with error. aborting");
+	    exit(1);
+	}
+    }
 }
 
 static void usage(const char * str1, const char * str2)
@@ -462,7 +482,8 @@ static void usage(const char * str1, const char * str2)
     debug(DEBUG_APPERROR, "             [-b <branch>]  [-l <regex>] [-r <tag> [-r <tag>]] ");
     debug(DEBUG_APPERROR, "             [-p <directory>] [-v] [-t] [--norc] [--summary-first]");
     debug(DEBUG_APPERROR, "             [--test-log <captured cvs log file>] [--bkcvs]");
-    debug(DEBUG_APPERROR, "             [--no-rcmds] [--diff-opts <option string>]");
+    debug(DEBUG_APPERROR, "             [--no-rcmds] [--diff-opts <option string>] [--cvs-direct]");
+    debug(DEBUG_APPERROR, "             [--debuglvl <bitmask>]");
     debug(DEBUG_APPERROR, "");
     debug(DEBUG_APPERROR, "Where:");
     debug(DEBUG_APPERROR, "  -h display this informative message");
@@ -490,6 +511,8 @@ static void usage(const char * str1, const char * str2)
     debug(DEBUG_APPERROR, "  --diff-opts <option string> supply special set of options to diff");
     debug(DEBUG_APPERROR, "  --bkcvs special hack for parsing the BK -> CVS log format");
     debug(DEBUG_APPERROR, "  --no-rcmds disable rlog and rdiff (they're faulty in some setups)");
+    debug(DEBUG_APPERROR, "  --cvs-direct enable built-in cvs client code");
+    debug(DEBUG_APPERROR, "  --debuglvl <bitmask> enable various debug channels.");
     debug(DEBUG_APPERROR, "\ncvsps version %s\n", VERSION);
 
     exit(1);
@@ -565,7 +588,7 @@ static void parse_args(int argc, char *argv[])
 	    if (++i >= argc)
 		usage("argument to -l missing", "");
 
-	    if ((err = regcomp(&restrict_log, argv[i++], REG_NOSUB)) != 0)
+	    if ((err = regcomp(&restrict_log, argv[i++], REG_EXTENDED|REG_NOSUB)) != 0)
 	    {
 		char errbuf[256];
 		regerror(err, &restrict_log, errbuf, 256);
@@ -579,10 +602,20 @@ static void parse_args(int argc, char *argv[])
 
 	if (strcmp(argv[i], "-f") == 0)
 	{
+	    int err;
+
 	    if (++i >= argc)
 		usage("argument to -f missing", "");
 
-	    restrict_file = argv[i++];
+	    if ((err = regcomp(&restrict_file, argv[i++], REG_EXTENDED|REG_NOSUB)) != 0)
+	    {
+		char errbuf[256];
+		regerror(err, &restrict_file, errbuf, 256);
+		usage("bad regex to -f", errbuf);
+	    }
+
+	    have_restrict_file = 1;
+
 	    continue;
 	}
 	
@@ -713,6 +746,22 @@ static void parse_args(int argc, char *argv[])
 	    continue;
 	}
 
+	if (strcmp(argv[i], "--cvs-direct") == 0)
+	{
+	    cvs_direct = 1;
+	    i++;
+	    continue;
+	}
+
+	if (strcmp(argv[i], "--debuglvl") == 0)
+	{
+	    if (++i >= argc)
+		usage("argument to --debuglvl missing", "");
+
+	    debuglvl = atoi(argv[i++]);
+	    continue;
+	}
+
 	usage("invalid argument", argv[i]);
     }
 }
@@ -720,7 +769,7 @@ static void parse_args(int argc, char *argv[])
 static void init_strip_path()
 {
     FILE * fp;
-    char root_buff[PATH_MAX], *p;
+    char * p;
     int len;
 
     if (!(fp = fopen("CVS/Root", "r")))
@@ -729,7 +778,7 @@ static void init_strip_path()
 	exit(1);
     }
     
-    if (!fgets(root_buff, PATH_MAX, fp))
+    if (!fgets(root_path, PATH_MAX, fp))
     {
 	debug(DEBUG_APPERROR, "Error reading CVSROOT");
 	exit(1);
@@ -737,17 +786,18 @@ static void init_strip_path()
 
     fclose(fp);
 
-    p = strrchr(root_buff, ':');
+    p = strrchr(root_path, ':');
 
     if (!p)
-	p = root_buff;
+	p = root_path;
     else 
 	p++;
 
-    len = strlen(root_buff) - 1;
-    root_buff[len] = 0;
-    if (root_buff[len - 1] == '/')
-	root_buff[--len] = 0;
+    /* chop the lf and optional '/' */
+    len = strlen(root_path) - 1;
+    root_path[len] = 0;
+    if (root_path[len - 1] == '/')
+	root_path[--len] = 0;
 
     if (!(fp = fopen("CVS/Repository", "r")))
     {
@@ -1034,23 +1084,6 @@ static void check_print_patch_set(PatchSet * ps)
     if (ps->psid < 0)
 	return;
 
-    if (restrict_date_start > 0 &&
-	(ps->date < restrict_date_start ||
-	 (restrict_date_end > 0 && ps->date > restrict_date_end)))
-	return;
-
-    if (restrict_author && strcmp(restrict_author, ps->author) != 0)
-	return;
-
-    if (have_restrict_log && regexec(&restrict_log, ps->descr, 0, NULL, 0) != 0)
-	return;
-
-    if (restrict_file && !patch_set_contains_member(ps, restrict_file))
-	return;
-
-    if (restrict_branch && !patch_set_affects_branch(ps, restrict_branch))
-	return;
-    
     /* the funk_factor overrides the restrict_tag_start and end */
     if (ps->funk_factor == FNK_SHOW_SOME || ps->funk_factor == FNK_SHOW_ALL)
 	goto ok;
@@ -1091,6 +1124,23 @@ static void check_print_patch_set(PatchSet * ps)
     }
 
  ok:
+    if (restrict_date_start > 0 &&
+	(ps->date < restrict_date_start ||
+	 (restrict_date_end > 0 && ps->date > restrict_date_end)))
+	return;
+
+    if (restrict_author && strcmp(restrict_author, ps->author) != 0)
+	return;
+
+    if (have_restrict_log && regexec(&restrict_log, ps->descr, 0, NULL, 0) != 0)
+	return;
+
+    if (have_restrict_file && !patch_set_member_regex(ps, &restrict_file))
+	return;
+
+    if (restrict_branch && !patch_set_affects_branch(ps, restrict_branch))
+	return;
+    
     if (!list_empty(&show_patch_set_ranges))
     {
 	struct list_head * next = show_patch_set_ranges.next;
@@ -1332,7 +1382,7 @@ static int is_revision_metadata(const char * buff)
     return 0;
 }
 
-static int patch_set_contains_member(PatchSet * ps, const char * file)
+static int patch_set_member_regex(PatchSet * ps, regex_t * reg)
 {
     struct list_head * next = ps->members.next;
 
@@ -1340,7 +1390,7 @@ static int patch_set_contains_member(PatchSet * ps, const char * file)
     {
 	PatchSetMember * psm = list_entry(next, PatchSetMember, link);
 	
-	if (strstr(psm->file->filename, file))
+	if (regexec(&restrict_file, psm->file->filename, 0, NULL, 0) == 0)
 	    return 1;
 
 	next = next->next;
@@ -1381,6 +1431,7 @@ static void do_cvs_diff(PatchSet * ps)
     const char * dopts;
     const char * utype;
     char use_rep_path[PATH_MAX];
+    int rcmd = 0;
 
     fflush(stdout);
     fflush(stderr);
@@ -1390,6 +1441,7 @@ static void do_cvs_diff(PatchSet * ps)
 	dopts = "-u";
 	dtype = "rdiff";
 	utype = "co";
+	rcmd = 1;
 	sprintf(use_rep_path, "%s/", repository_path);
     }
     else
@@ -1438,27 +1490,54 @@ static void do_cvs_diff(PatchSet * ps)
 	 */
 	if (!psm->pre_rev || psm->pre_rev->dead)
 	{
-	    /* a 'create file' diff */
-	    snprintf(cmdbuff, PATH_MAX * 2, "cvs %s %s -p -r %s %s%s | diff %s /dev/null - | sed -e '2 s|^+++ -|+++ %s%s|g'",
-		     norc, utype, psm->post_rev->rev, use_rep_path, psm->file->filename, dopts, 
-		     use_rep_path, psm->file->filename);
+	    if (cvs_direct && rcmd)
+	    {
+		strcpy(cmdbuff, "true");
+		cvs_rupdate(cvs_direct_ctx, use_rep_path, psm->file->filename, psm->post_rev->rev, 1, dopts);
+	    }
+	    else
+	    {
+		/* a 'create file' diff */
+		snprintf(cmdbuff, PATH_MAX * 2, "cvs %s %s -p -r %s %s%s | diff %s /dev/null - | sed -e '2 s|^+++ -|+++ %s%s|g'",
+			 norc, utype, psm->post_rev->rev, use_rep_path, psm->file->filename, dopts, 
+			 use_rep_path, psm->file->filename);
+	    }
 	}
 	else if (psm->post_rev->dead)
 	{
-	    /* a 'remove file' diff */
-	    snprintf(cmdbuff, PATH_MAX * 2, "cvs %s %s -p -r %s %s%s | diff %s - /dev/null | sed -e '1 s|^--- -|--- %s%s|g'",
-		     norc, utype, psm->pre_rev->rev, use_rep_path, psm->file->filename, dopts, 
-		     use_rep_path, psm->file->filename);
-	    
+	    if (cvs_direct && rcmd)
+	    {
+		strcpy(cmdbuff, "true");
+		cvs_rupdate(cvs_direct_ctx, use_rep_path, psm->file->filename, psm->pre_rev->rev, 0, dopts);
+	    }
+	    else
+	    {
+		/* a 'remove file' diff */
+		snprintf(cmdbuff, PATH_MAX * 2, "cvs %s %s -p -r %s %s%s | diff %s - /dev/null | sed -e '1 s|^--- -|--- %s%s|g'",
+			 norc, utype, psm->pre_rev->rev, use_rep_path, psm->file->filename, dopts, 
+			 use_rep_path, psm->file->filename);
+	    }
 	}
 	else
 	{
 	    /* a regular diff */
-	    snprintf(cmdbuff, PATH_MAX * 2, "cvs %s %s %s -r %s -r %s %s%s",
-		     norc, dtype, dopts, psm->pre_rev->rev, psm->post_rev->rev, use_rep_path, psm->file->filename);
+	    if (cvs_direct && rcmd)
+	    {
+		strcpy(cmdbuff, "true");
+		cvs_rdiff(cvs_direct_ctx, use_rep_path, psm->file->filename, psm->pre_rev->rev, psm->post_rev->rev, dopts);
+	    }
+	    else
+	    {
+		snprintf(cmdbuff, PATH_MAX * 2, "cvs %s %s %s -r %s -r %s %s%s",
+			 norc, dtype, dopts, psm->pre_rev->rev, psm->post_rev->rev, use_rep_path, psm->file->filename);
+	    }
 	}
 
-	system(cmdbuff);
+	if (system(cmdbuff))
+	{
+	    debug(DEBUG_APPERROR, "system command returned non-zero exit status. aborting");
+	    exit(1);
+	}
     }
 }
 

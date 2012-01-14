@@ -1,4 +1,4 @@
-Version: 2.0b5
+Version: 2.0b6
 Summary: CVSps is a program for generating 'patchset' information from a CVS repository
 Name: cvsps
 Release: 1
