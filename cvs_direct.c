@@ -135,6 +135,8 @@ CvsServerCtx * open_cvs_server(char * p_root, int compress)
 	    send_string(ctx, "Gzip-stream %d\n", compress);
 	    ctx->compressed = 1;
 	}
+
+	debug(DEBUG_APPMSG1, "cvs_direct initialized to CVSROOT %s", ctx->root);
     }
 
     return ctx;
@@ -327,7 +329,7 @@ void close_cvs_server(CvsServerCtx * ctx)
 {
     if (ctx->compressed)
     {
-	int ret, len;
+	int ret, len, pass=0;
 	char buff[BUFSIZ];
 	    
 	do
@@ -348,7 +350,12 @@ void close_cvs_server(CvsServerCtx * ctx)
 
 	do
 	{
-	    if (ctx->zin.avail_in == 0)
+	    /* 
+	     * we don't want to do a 'read' unless we know that the end-of-stream
+	     * isn't already buffered somewhere (i.e. we already got it!). check
+	     * the 'pass' value
+	     */
+	    if (ctx->zin.avail_in == 0 && ctx->zin.avail_out != 0 && pass > 0)
 	    {
 		len = read(ctx->read_fd, ctx->zread_buff, RD_BUFF_SIZE);
 		if (len > 0)
@@ -361,6 +368,8 @@ void close_cvs_server(CvsServerCtx * ctx)
 		    debug(DEBUG_APPERROR, "cvs_direct: zin: EOF or ERROR waiting for Z_STREAM_END");
 		}
 	    }
+
+	    pass++;
 
 	    ctx->zin.next_out = buff;
 	    ctx->zin.avail_out = BUFSIZ;
@@ -610,6 +619,7 @@ static void ctx_to_fp(CvsServerCtx * ctx, FILE * fp)
     while (1)
     {
 	read_line(ctx, line);
+	debug(DEBUG_TCP, "ctx_to_fp: %s", line);
 	if (line[0] == 'M')
 	{
 	    if (fp)
@@ -646,7 +656,7 @@ void cvs_rupdate(CvsServerCtx * ctx, const char * rep, const char * file, const 
     FILE * fp;
     char cmdbuff[BUFSIZ];
     
-    snprintf(cmdbuff, BUFSIZ, "diff %s %s /dev/null %s | sed -e '%s s|^+++ -|+++ %s%s|g'",
+    snprintf(cmdbuff, BUFSIZ, "diff %s %s /dev/null %s | sed -e '%s s|^\\([+-][+-][+-]\\) -|\\1 %s/%s|g'",
 	     opts, create?"":"-", create?"-":"", create?"2":"1", rep, file);
 
     debug(DEBUG_TCP, "cmdbuff: %s", cmdbuff);
@@ -660,7 +670,7 @@ void cvs_rupdate(CvsServerCtx * ctx, const char * rep, const char * file, const 
     send_string(ctx, "Argument -p\n");
     send_string(ctx, "Argument -r\n");
     send_string(ctx, "Argument %s\n", rev);
-    send_string(ctx, "Argument %s%s\n", rep, file);
+    send_string(ctx, "Argument %s/%s\n", rep, file);
     send_string(ctx, "co\n");
 
     ctx_to_fp(ctx, fp);
