@@ -3,7 +3,7 @@
 CVSps \- create patchset information from CVS
 .SH SYNOPSIS
 .B cvsps
-[-x] [-u] [-z <fuzz>] [-s <patchset>] [-a <author>] [-f <file>] [-d <date1> [-d <date2>]] [-b <branch>] [-v] [-h]
+[-x] [-u] [-z <fuzz>] [-s <patchset>] [-a <author>] [-l <text>] [-f <file>] [-d <date1> [-d <date2>]] [-b <branch>] [-p <patchdir>] [-v] [-h]
 .SH DESCRIPTION
 CVSps is a program for generating 'patchset' information from a CVS
 repository.  A patchset in this case is defined as a set of changes made
@@ -15,10 +15,10 @@ information, it is often difficult to see what changes were committed
 .SH OPTIONS
 .TP
 .B \-x
-ignore (and rebuild) CVS/cvsps.cache file
+ignore (and rebuild) ~/.cvsps/cvsps.cache file
 .TP
 .B \-u
-update CVS/cvsps.cache file
+update ~/.cvsps/cvsps.cache file
 .TP
 .B \-z <fuzz>
 set the timestamp fuzz factor for identifying patch sets
@@ -26,8 +26,14 @@ set the timestamp fuzz factor for identifying patch sets
 .B \-s <patchset>[-<patchset>[,<patchset>[-<patchset>...]]]
 generate a diff for a given patchsets and patchset ranges
 .TP
+.B \-p <dir>
+output individual patchsets as files in <dir> as <dir>/<patchset>.patch
+.TP
 .B \-a <author>
 restrict output to patchsets created by author
+.TP
+.B \-l <regex>
+restrict output to patchsets matching regex in log message
 .TP
 .B \-f <file>
 restrict output to patchsets involving file
@@ -37,8 +43,17 @@ if just one date specified, show
 revisions newer than date1.  If two dates specified,
 show revisions between two dates.
 .TP
+.B \-r <tag1> -r <tag2>
+if just one tag specified, show
+revisions since tag1. If two tags specified, show
+revisions between the two tags.
+.TP
 .B \-b <branch>
-restrict output to patchsets affecting history of branch
+restrict output to patchsets affecting history of branch.
+If you want to restrict to the main branch, use a branch of 'HEAD'.
+.TP
+.B \-p <directory>
+Output patchsets to individual files in <directory>
 .TP
 .B \-v
 show verbose parsing messages
@@ -48,6 +63,14 @@ show some brief memory usage statistics
 .TP
 .B \--norc
 when invoking cvs, ignore the .cvsrc file
+.TP
+.B \--summary-first
+when multiple patchset diffs are being generated, put the patchset
+summary for all patchsets at the beginning of the output.
+.TP
+.B \--test-log <captured cvs log file>
+for testing changes, you can capture cvs log output, then test against
+this captured file instead of hammering some poor CVS server
 .TP
 .B \-h
 display usage summary
