@@ -9,6 +9,7 @@
 #include <limits.h>
 #include <stdarg.h>
 #include <zlib.h>
+#include <sys/socket.h>
 #include <cbtcommon/debug.h>
 #include <cbtcommon/text_util.h>
 #include <cbtcommon/tcpsocket.h>
@@ -24,6 +25,8 @@ struct _CvsServerCtx
     int read_fd;
     int write_fd;
     char root[PATH_MAX];
+
+    int is_pserver;
 
     /* buffered reads from descriptor */
     char read_buff[RD_BUFF_SIZE];
@@ -58,6 +61,7 @@ CvsServerCtx * open_cvs_server(char * p_root, int compress)
     ctx->head = ctx->tail = ctx->read_buff;
     ctx->read_fd = ctx->write_fd = -1;
     ctx->compressed = 0;
+    ctx->is_pserver = 0;
 
     if (compress)
     {
@@ -118,8 +122,8 @@ CvsServerCtx * open_cvs_server(char * p_root, int compress)
     {
 	send_string(ctx, "Root %s\n", ctx->root);
 
-	/* this is taken from 1.11.1p1 trace */
-	send_string(ctx, "Valid-responses ok error Valid-requests Checked-in New-entry Checksum Copy-file Updated Created Update-existing Merged Patched Rcs-diff Mode Mod-time Removed Remove-entry Set-static-directory Clear-static-directory Set-sticky Clear-sticky Template Set-checkin-prog Set-update-prog Notified Module-expansion Wrapper-rcsOption M Mbinary E F MT\n", ctx->root);
+	/* this is taken from 1.11.1p1 trace - but with Mbinary removed. we can't handle it (yet!) */
+	send_string(ctx, "Valid-responses ok error Valid-requests Checked-in New-entry Checksum Copy-file Updated Created Update-existing Merged Patched Rcs-diff Mode Mod-time Removed Remove-entry Set-static-directory Clear-static-directory Set-sticky Clear-sticky Template Set-checkin-prog Set-update-prog Notified Module-expansion Wrapper-rcsOption M E F MT\n", ctx->root);
 
 	send_string(ctx, "valid-requests\n");
 
@@ -214,6 +218,7 @@ static CvsServerCtx * open_ctx_pserver(CvsServerCtx * ctx, const char * p_root)
 	goto out_close_err;
 
     strcpy(ctx->root, p);
+    ctx->is_pserver = 1;
 
     return ctx;
 
@@ -327,11 +332,18 @@ static CvsServerCtx * open_ctx_forked(CvsServerCtx * ctx, const char * p_root)
 
 void close_cvs_server(CvsServerCtx * ctx)
 {
+    /* FIXME: some sort of flushing should be done for non-compressed case */
+
     if (ctx->compressed)
     {
-	int ret, len, pass=0;
+	int ret, len;
 	char buff[BUFSIZ];
-	    
+
+	/* 
+	 * there shouldn't be anything left, but we do want
+	 * to send an 'end of stream' marker, (if such a thing
+	 * actually exists..)
+	 */
 	do
 	{
 	    ctx->zout.next_out = buff;
@@ -348,58 +360,104 @@ void close_cvs_server(CvsServerCtx * ctx)
 	    }
 	} while (ret == Z_OK);
 
-	do
+	if ((ret = deflateEnd(&ctx->zout)) != Z_OK)
+	    debug(DEBUG_APPERROR, "cvs_direct: zout: deflateEnd error: %s: %s", 
+		  (ret == Z_STREAM_ERROR) ? "Z_STREAM_ERROR":"Z_DATA_ERROR", ctx->zout.msg);
+    }
+    
+    /* we're done writing now */
+    debug(DEBUG_TCP, "cvs_direct: closing cvs server write connection %d", ctx->write_fd);
+    close(ctx->write_fd);
+
+    /* 
+     * if this is pserver, then read_fd is a bi-directional socket.
+     * we want to shutdown the write side, just to make sure the 
+     * server get's eof
+     */
+    if (ctx->is_pserver)
+    {
+	debug(DEBUG_TCP, "cvs_direct: shutdown on read socket");
+	if (shutdown(ctx->read_fd, SHUT_WR) < 0)
+	    debug(DEBUG_SYSERROR, "cvs_direct: error with shutdown on pserver socket");
+    }
+
+    if (ctx->compressed)
+    {
+	int ret = Z_OK, len, eof = 0;
+	char buff[BUFSIZ];
+
+	/* read to the 'eof'/'eos' marker.  there are two states we 
+	 * track, looking for Z_STREAM_END (application level EOS)
+	 * and EOF on socket.  Both should happen at the same time,
+	 * but we need to do the read first, the first time through
+	 * the loop, but we want to do one read after getting Z_STREAM_END
+	 * too.  so this loop has really ugly exit conditions.
+	 */
+	for(;;)
 	{
-	    /* 
-	     * we don't want to do a 'read' unless we know that the end-of-stream
-	     * isn't already buffered somewhere (i.e. we already got it!). check
-	     * the 'pass' value
+	    /*
+	     * if there's nothing in the avail_in, and we
+	     * inflated everything last pass (avail_out != 0)
+	     * then slurp some more from the descriptor, 
+	     * if we get EOF, exit the loop
 	     */
-	    if (ctx->zin.avail_in == 0 && ctx->zin.avail_out != 0 && pass > 0)
+	    if (ctx->zin.avail_in == 0 && ctx->zin.avail_out != 0)
 	    {
+		debug(DEBUG_TCP, "cvs_direct: doing final slurp");
 		len = read(ctx->read_fd, ctx->zread_buff, RD_BUFF_SIZE);
-		if (len > 0)
+		debug(DEBUG_TCP, "cvs_direct: did final slurp: %d", len);
+
+		if (len <= 0)
 		{
-		    ctx->zin.next_in = ctx->zread_buff;
-		    ctx->zin.avail_in = len;
+		    eof = 1;
+		    break;
 		}
-		else 
-		{
-		    debug(DEBUG_APPERROR, "cvs_direct: zin: EOF or ERROR waiting for Z_STREAM_END");
-		}
+
+		/* put the data into the inflate input stream */
+		ctx->zin.next_in = ctx->zread_buff;
+		ctx->zin.avail_in = len;
 	    }
 
-	    pass++;
+	    /* 
+	     * if the last time through we got Z_STREAM_END, and we 
+	     * get back here, it means we should've gotten EOF but
+	     * didn't
+	     */
+	    if (ret == Z_STREAM_END)
+		break;
 
 	    ctx->zin.next_out = buff;
 	    ctx->zin.avail_out = BUFSIZ;
 
 	    ret = inflate(&ctx->zin, Z_SYNC_FLUSH);
 	    len = BUFSIZ - ctx->zin.avail_out;
+	    
+	    if (ret == Z_BUF_ERROR)
+		debug(DEBUG_APPERROR, "Z_BUF_ERROR");
+
+	    if (ret == Z_OK && len == 0)
+		debug(DEBUG_TCP, "cvs_direct: no data out of inflate");
+
+	    if (ret == Z_STREAM_END)
+		debug(DEBUG_TCP, "cvs_direct: got Z_STREAM_END");
+
 	    if ((ret == Z_OK || ret == Z_STREAM_END) && len > 0)
 		hexdump(buff, BUFSIZ - ctx->zin.avail_out, "cvs_direct: zin: unread data at close");
-	} while (ret == Z_OK);
+	}
 
-	if ((ret = deflateEnd(&ctx->zout)) != Z_OK)
-	    debug(DEBUG_APPERROR, "cvs_direct: zout: deflateEnd error: %s: %s", 
-		  (ret == Z_STREAM_ERROR) ? "Z_STREAM_ERROR":"Z_DATA_ERROR", ctx->zout.msg);
+	if (ret != Z_STREAM_END)
+	    debug(DEBUG_APPERROR, "cvs_direct: zin: Z_STREAM_END not encountered (premature EOF?)");
+
+	if (eof == 0)
+	    debug(DEBUG_APPERROR, "cvs_direct: zin: EOF not encountered (premature Z_STREAM_END?)");
 
 	if ((ret = inflateEnd(&ctx->zin)) != Z_OK)
 	    debug(DEBUG_APPERROR, "cvs_direct: zin: inflateEnd error: %s: %s", 
-		  (ret == Z_STREAM_ERROR) ? "Z_STREAM_ERROR":"Z_DATA_ERROR", ctx->zin.msg);
+		  (ret == Z_STREAM_ERROR) ? "Z_STREAM_ERROR":"Z_DATA_ERROR", ctx->zin.msg ? ctx->zin.msg : "");
     }
 
-    if (ctx->read_fd >= 0)
-    {
-	debug(DEBUG_TCP, "cvs_direct: closing cvs server connection %d", ctx->read_fd);
-	close(ctx->read_fd);
-    }
-
-    if (ctx->write_fd >= 0)
-    {
-	debug(DEBUG_TCP, "cvs_direct: closing cvs server connection %d", ctx->write_fd);
-	close(ctx->write_fd);
-    }
+    debug(DEBUG_TCP, "cvs_direct: closing cvs server read connection %d", ctx->read_fd);
+    close(ctx->read_fd);
 
     free(ctx);
 }
@@ -631,7 +689,8 @@ static void ctx_to_fp(CvsServerCtx * ctx, FILE * fp)
 	}
     }
 
-    fflush(fp);
+    if (fp)
+	fflush(fp);
 }
 
 void cvs_rdiff(CvsServerCtx * ctx, 
@@ -753,4 +812,78 @@ void cvs_diff(CvsServerCtx * ctx,
     send_string(ctx, "diff\n");
 
     ctx_to_fp(ctx, stdout);
+}
+
+/*
+ * FIXME: the design of this sucks.  It was originally designed to fork a subprocess
+ * which read the cvs response and send it back through a pipe the main process,
+ * which fdopen(3)ed the other end, and juts used regular fgets.  This however
+ * didn't work because the reads of compressed data in the child process altered
+ * the compression state, and there was no way to resynchronize that state with
+ * the parent process.  We could use threads...
+ */
+FILE * cvs_rlog_open(CvsServerCtx * ctx, const char * rep, const char * date_str)
+{
+    /* note: use of the date_str is handled in a non-standard, cvsps specific way */
+    if (date_str && date_str[0])
+    {
+	send_string(ctx, "Argument -d\n", rep);
+	send_string(ctx, "Argument %s<1 Jan 2038 05:00:00 -0000\n", date_str);
+	send_string(ctx, "Argument -d\n", rep);
+	send_string(ctx, "Argument %s\n", date_str);
+    }
+
+    send_string(ctx, "Argument %s\n", rep);
+    send_string(ctx, "rlog\n");
+
+    /*
+     * FIXME: is it possible to create a 'fake' FILE * whose 'refill'
+     * function is below?
+     */
+    return (FILE*)ctx;
+}
+
+char * cvs_rlog_fgets(char * buff, int buflen, CvsServerCtx * ctx)
+{
+    char lbuff[BUFSIZ];
+    int len;
+
+    len = read_line(ctx, lbuff);
+    debug(DEBUG_TCP, "cvs_direct: rlog: read %s", lbuff);
+
+    if (memcmp(lbuff, "M ", 2) == 0)
+    {
+	memcpy(buff, lbuff + 2, len - 2);
+	buff[len - 2 ] = '\n';
+	buff[len - 1 ] = 0;
+    }
+    else if (strcmp(lbuff, "ok") == 0 ||strcmp(lbuff, "error") == 0)
+    {
+	return NULL;
+    }
+
+    return buff;
+}
+
+void cvs_rlog_close(CvsServerCtx * ctx)
+{
+}
+
+void cvs_version(CvsServerCtx * ctx, char * client_version, char * server_version)
+{
+    char lbuff[BUFSIZ];
+    strcpy(client_version, "Client: Concurrent Versions System (CVS) 99.99.99 (client/server) cvs-direct");
+    send_string(ctx, "version\n");
+    read_line(ctx, lbuff);
+    if (memcmp(lbuff, "M ", 2) == 0)
+	sprintf(server_version, "Server: %s", lbuff + 2);
+    else
+	debug(DEBUG_APPERROR, "cvs_direct: didn't read version: %s", lbuff);
+    
+    read_line(ctx, lbuff);
+    if (strcmp(lbuff, "ok") != 0)
+	debug(DEBUG_APPERROR, "cvs_direct: protocol error reading version");
+
+    debug(DEBUG_TCP, "cvs_direct: client version %s", client_version);
+    debug(DEBUG_TCP, "cvs_direct: server version %s", server_version);
 }
